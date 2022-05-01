@@ -464,28 +464,56 @@ func (environ *Environment) BindSync(config *SyncConfig) {
 
 	environ.syncConfig = config
 
-	tradeWriter := func(trade types.Trade) {
-		if err := environ.TradeService.Insert(trade); err != nil {
-			log.WithError(err).Errorf("trade insert error: %+v", trade)
+	tradeWriterCreator := func(session *ExchangeSession) func(trade types.Trade) {
+		return func(trade types.Trade) {
+			trade.IsMargin = session.Margin
+			trade.IsFutures = session.Futures
+			if session.Margin {
+				trade.IsIsolated = session.IsolatedMargin
+			} else if session.Futures {
+				trade.IsIsolated = session.IsolatedFutures
+			}
+
+			// The StrategyID field and the PnL field needs to be updated by the strategy.
+			// trade.StrategyID, trade.PnL
+			if err := environ.TradeService.Insert(trade); err != nil {
+				log.WithError(err).Errorf("trade insert error: %+v", trade)
+			}
 		}
 	}
-	orderWriter := func(order types.Order) {
-		switch order.Status {
-		case types.OrderStatusFilled, types.OrderStatusCanceled:
-			if order.ExecutedQuantity.Sign() > 0 {
-				if err := environ.OrderService.Insert(order); err != nil {
-					log.WithError(err).Errorf("order insert error: %+v", order)
+
+	orderWriterCreator := func(session *ExchangeSession) func(order types.Order) {
+		return func(order types.Order) {
+			order.IsMargin = session.Margin
+			order.IsFutures = session.Futures
+			if session.Margin {
+				order.IsIsolated = session.IsolatedMargin
+			} else if session.Futures {
+				order.IsIsolated = session.IsolatedFutures
+			}
+
+			switch order.Status {
+			case types.OrderStatusFilled, types.OrderStatusCanceled:
+				if order.ExecutedQuantity.Sign() > 0 {
+					if err := environ.OrderService.Insert(order); err != nil {
+						log.WithError(err).Errorf("order insert error: %+v", order)
+					}
 				}
 			}
 		}
 	}
 
 	for _, session := range environ.sessions {
+		// avoid using the iterator variable.
+		s2 := session
 		// if trade sync is on, we will write all received trades
 		if config.UserDataStream.Trades {
+			tradeWriter := tradeWriterCreator(s2)
 			session.UserDataStream.OnTradeUpdate(tradeWriter)
 		}
+
 		if config.UserDataStream.FilledOrders {
+			orderWriter := orderWriterCreator(s2)
 			session.UserDataStream.OnOrderUpdate(orderWriter)
 		}
 	}
@@ -561,11 +589,31 @@ func (environ *Environment) Sync(ctx context.Context, userConfig ...*Config) err
 		if len(selectedSessions) > 0 {
 			sessions = environ.SelectSessions(selectedSessions...)
 		}
+
 		for _, session := range sessions {
 			if err := environ.syncSession(ctx, session, syncSymbols...); err != nil {
 				return err
 			}
+
+			if userConfig[0].Sync.DepositHistory {
+				if err := environ.SyncService.SyncDepositHistory(ctx, session.Exchange); err != nil {
+					return err
+				}
+			}
+
+			if userConfig[0].Sync.WithdrawHistory {
+				if err := environ.SyncService.SyncWithdrawHistory(ctx, session.Exchange); err != nil {
+					return err
+				}
+			}
+
+			if userConfig[0].Sync.RewardHistory {
+				if err := environ.SyncService.SyncRewardHistory(ctx, session.Exchange); err != nil {
+					return err
+				}
+			}
 		}
+
 		return nil
 	}
 
@@ -573,6 +621,24 @@ func (environ *Environment) Sync(ctx context.Context, userConfig ...*Config) err
 	for _, session := range environ.sessions {
 		if err := environ.syncSession(ctx, session); err != nil {
 			return err
+		}
+
+		if userConfig[0].Sync.DepositHistory {
+			if err := environ.SyncService.SyncDepositHistory(ctx, session.Exchange); err != nil {
+				return err
+			}
+		}
+
+		if userConfig[0].Sync.WithdrawHistory {
+			if err := environ.SyncService.SyncWithdrawHistory(ctx, session.Exchange); err != nil {
+				return err
+			}
+		}
+
+		if userConfig[0].Sync.RewardHistory {
+			if err := environ.SyncService.SyncRewardHistory(ctx, session.Exchange); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -840,10 +906,16 @@ func (environ *Environment) setupSlack(userConfig *Config, slackToken string, pe
 
 	log.Debugf("adding slack notifier with default channel: %s", conf.DefaultChannel)
 
-	var client = slack.New(slackToken,
-		slack.OptionDebug(true),
+	var slackOpts = []slack.Option{
 		slack.OptionLog(stdlog.New(os.Stdout, "api: ", stdlog.Lshortfile|stdlog.LstdFlags)),
-		slack.OptionAppLevelToken(slackAppToken))
+		slack.OptionAppLevelToken(slackAppToken),
+	}
+
+	if b, ok := util.GetEnvVarBool("DEBUG_SLACK"); ok {
+		slackOpts = append(slackOpts, slack.OptionDebug(b))
+	}
+
+	var client = slack.New(slackToken, slackOpts...)
 
 	var notifier = slacknotifier.New(client, conf.DefaultChannel)
 	environ.AddNotifier(notifier)
