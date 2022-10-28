@@ -8,7 +8,7 @@ import (
 	"github.com/slack-go/slack"
 
 	"github.com/c9s/bbgo/pkg/fixedpoint"
-	"github.com/c9s/bbgo/pkg/util"
+	"github.com/c9s/bbgo/pkg/util/templateutil"
 )
 
 type PositionType string
@@ -50,6 +50,7 @@ type Position struct {
 	// TotalFee stores the fee currency -> total fee quantity
 	TotalFee map[string]fixedpoint.Value `json:"totalFee" db:"-"`
 
+	OpenedAt  time.Time `json:"openedAt,omitempty" db:"-"`
 	ChangedAt time.Time `json:"changedAt,omitempty" db:"changed_at"`
 
 	Strategy           string `json:"strategy,omitempty" db:"strategy"`
@@ -58,6 +59,37 @@ type Position struct {
 	AccumulatedProfit fixedpoint.Value `json:"accumulatedProfit,omitempty" db:"accumulated_profit"`
 
 	sync.Mutex
+
+	// Modify position callbacks
+	modifyCallbacks []func(baseQty fixedpoint.Value, quoteQty fixedpoint.Value, price fixedpoint.Value)
+}
+
+func (p *Position) CsvHeader() []string {
+	return []string{
+		"symbol",
+		"time",
+		"average_cost",
+		"base",
+		"quote",
+		"accumulated_profit",
+	}
+}
+
+func (p *Position) CsvRecords() [][]string {
+	if p.AverageCost.IsZero() && p.Base.IsZero() {
+		return nil
+	}
+
+	return [][]string{
+		{
+			p.Symbol,
+			p.ChangedAt.UTC().Format(time.RFC1123),
+			p.AverageCost.String(),
+			p.Base.String(),
+			p.Quote.String(),
+			p.AccumulatedProfit.String(),
+		},
+	}
 }
 
 // NewProfit generates the profit object from the current position
@@ -72,8 +104,11 @@ func (p *Position) NewProfit(trade Trade, profit, netProfit fixedpoint.Value) Pr
 		NetProfit:       netProfit,
 		ProfitMargin:    profit.Div(trade.QuoteQuantity),
 		NetProfitMargin: netProfit.Div(trade.QuoteQuantity),
+
 		// trade related fields
+		Trade:         &trade,
 		TradeID:       trade.ID,
+		OrderID:       trade.OrderID,
 		Side:          trade.Side,
 		IsBuyer:       trade.IsBuyer,
 		IsMaker:       trade.IsMaker,
@@ -84,17 +119,35 @@ func (p *Position) NewProfit(trade Trade, profit, netProfit fixedpoint.Value) Pr
 		Fee:         trade.Fee,
 		FeeCurrency: trade.FeeCurrency,
 
-		Exchange:   trade.Exchange,
-		IsMargin:   trade.IsMargin,
-		IsFutures:  trade.IsFutures,
-		IsIsolated: trade.IsIsolated,
-		TradedAt:   trade.Time.Time(),
+		Exchange:           trade.Exchange,
+		IsMargin:           trade.IsMargin,
+		IsFutures:          trade.IsFutures,
+		IsIsolated:         trade.IsIsolated,
+		TradedAt:           trade.Time.Time(),
+		Strategy:           p.Strategy,
+		StrategyInstanceID: p.StrategyInstanceID,
+
+		PositionOpenedAt: p.OpenedAt,
 	}
 }
 
-func (p *Position) NewClosePositionOrder(percentage fixedpoint.Value) *SubmitOrder {
+// ROI -- Return on investment (ROI) is a performance measure used to evaluate the efficiency or profitability of an investment
+// or compare the efficiency of a number of different investments.
+// ROI tries to directly measure the amount of return on a particular investment, relative to the investment's cost.
+func (p *Position) ROI(price fixedpoint.Value) fixedpoint.Value {
+	unrealizedProfit := p.UnrealizedProfit(price)
+	cost := p.AverageCost.Mul(p.Base.Abs())
+	return unrealizedProfit.Div(cost)
+}
+
+func (p *Position) NewMarketCloseOrder(percentage fixedpoint.Value) *SubmitOrder {
 	base := p.GetBase()
-	quantity := base.Mul(percentage)
+
+	quantity := base.Abs()
+	if percentage.Compare(fixedpoint.One) < 0 {
+		quantity = quantity.Mul(percentage)
+	}
+
 	if quantity.Compare(p.Market.MinQuantity) < 0 {
 		return nil
 	}
@@ -108,19 +161,81 @@ func (p *Position) NewClosePositionOrder(percentage fixedpoint.Value) *SubmitOrd
 	}
 
 	return &SubmitOrder{
-		Symbol:   p.Symbol,
-		Market:   p.Market,
-		Type:     OrderTypeMarket,
-		Side:     side,
-		Quantity: quantity,
+		Symbol:           p.Symbol,
+		Market:           p.Market,
+		Type:             OrderTypeMarket,
+		Side:             side,
+		Quantity:         quantity,
+		MarginSideEffect: SideEffectTypeAutoRepay,
 	}
 }
 
+func (p *Position) IsDust(price fixedpoint.Value) bool {
+	base := p.Base.Abs()
+	return p.Market.IsDustQuantity(base, price)
+}
+
+// GetBase locks the mutex and return the base quantity
+// The base quantity can be negative
 func (p *Position) GetBase() (base fixedpoint.Value) {
 	p.Lock()
 	base = p.Base
 	p.Unlock()
 	return base
+}
+
+func (p *Position) GetQuantity() fixedpoint.Value {
+	base := p.GetBase()
+	return base.Abs()
+}
+
+func (p *Position) UnrealizedProfit(price fixedpoint.Value) fixedpoint.Value {
+	quantity := p.GetBase().Abs()
+
+	if p.IsLong() {
+		return price.Sub(p.AverageCost).Mul(quantity)
+	} else if p.IsShort() {
+		return p.AverageCost.Sub(price).Mul(quantity)
+	}
+
+	return fixedpoint.Zero
+}
+
+func (p *Position) OnModify(cb func(baseQty fixedpoint.Value, quoteQty fixedpoint.Value, price fixedpoint.Value)) {
+	p.modifyCallbacks = append(p.modifyCallbacks, cb)
+}
+
+func (p *Position) EmitModify(baseQty fixedpoint.Value, quoteQty fixedpoint.Value, price fixedpoint.Value) {
+	for _, cb := range p.modifyCallbacks {
+		cb(baseQty, quoteQty, price)
+	}
+}
+
+// ModifyBase modifies position base quantity with `qty`
+func (p *Position) ModifyBase(qty fixedpoint.Value) error {
+	p.Base = qty
+
+	p.EmitModify(p.Base, p.Quote, p.AverageCost)
+
+	return nil
+}
+
+// ModifyQuote modifies position quote quantity with `qty`
+func (p *Position) ModifyQuote(qty fixedpoint.Value) error {
+	p.Quote = qty
+
+	p.EmitModify(p.Base, p.Quote, p.AverageCost)
+
+	return nil
+}
+
+// ModifyAverageCost modifies position average cost with `price`
+func (p *Position) ModifyAverageCost(price fixedpoint.Value) error {
+	p.AverageCost = price
+
+	p.EmitModify(p.Base, p.Quote, p.AverageCost)
+
+	return nil
 }
 
 type FuturesPosition struct {
@@ -145,11 +260,13 @@ type FuturesPosition struct {
 	Isolated     bool  `json:"isolated"`
 	UpdateTime   int64 `json:"updateTime"`
 	PositionRisk *PositionRisk
-
-	sync.Mutex
 }
 
 func NewPositionFromMarket(market Market) *Position {
+	if len(market.BaseCurrency) == 0 || len(market.QuoteCurrency) == 0 {
+		panic("logical exception: missing market information, base currency or quote currency is empty")
+	}
+
 	return &Position{
 		Symbol:        market.Symbol,
 		BaseCurrency:  market.BaseCurrency,
@@ -193,6 +310,22 @@ func (p *Position) SetExchangeFeeRate(ex ExchangeName, exchangeFee ExchangeFee) 
 	p.ExchangeFeeRates[ex] = exchangeFee
 }
 
+func (p *Position) IsShort() bool {
+	return p.Base.Sign() < 0
+}
+
+func (p *Position) IsLong() bool {
+	return p.Base.Sign() > 0
+}
+
+func (p *Position) IsClosed() bool {
+	return p.Base.Sign() == 0
+}
+
+func (p *Position) IsOpened(currentPrice fixedpoint.Value) bool {
+	return !p.IsClosed() && !p.IsDust(currentPrice)
+}
+
 func (p *Position) Type() PositionType {
 	if p.Base.Sign() > 0 {
 		return PositionLong
@@ -222,7 +355,7 @@ func (p *Position) SlackAttachment() slack.Attachment {
 		color = "#DC143C"
 	}
 
-	title := util.Render(string(posType)+` Position {{ .Symbol }} `, p)
+	title := templateutil.Render(string(posType)+` Position {{ .Symbol }} `, p)
 
 	fields := []slack.AttachmentField{
 		{Title: "Average Cost", Value: averageCost.String() + " " + p.QuoteCurrency, Short: true},
@@ -248,7 +381,7 @@ func (p *Position) SlackAttachment() slack.Attachment {
 		Title:  title,
 		Color:  color,
 		Fields: fields,
-		Footer: util.Render("update time {{ . }}", time.Now().Format(time.RFC822)),
+		Footer: templateutil.Render("update time {{ . }}", time.Now().Format(time.RFC822)),
 		// FooterIcon: "",
 	}
 }
@@ -309,30 +442,36 @@ func (p *Position) AddTrade(td Trade) (profit fixedpoint.Value, netProfit fixedp
 
 	// calculated fee in quote (some exchange accounts may enable platform currency fee discount, like BNB)
 	// convert platform fee token into USD values
-	var feeInQuote fixedpoint.Value = fixedpoint.Zero
+	var feeInQuote = fixedpoint.Zero
 
 	switch td.FeeCurrency {
 
 	case p.BaseCurrency:
-		quantity = quantity.Sub(fee)
+		if !td.IsFutures {
+			quantity = quantity.Sub(fee)
+		}
 
 	case p.QuoteCurrency:
-		quoteQuantity = quoteQuantity.Sub(fee)
+		if !td.IsFutures {
+			quoteQuantity = quoteQuantity.Sub(fee)
+		}
 
 	default:
-		if p.ExchangeFeeRates != nil {
-			if exchangeFee, ok := p.ExchangeFeeRates[td.Exchange]; ok {
-				if td.IsMaker {
-					feeInQuote = feeInQuote.Add(exchangeFee.MakerFeeRate.Mul(quoteQuantity))
-				} else {
-					feeInQuote = feeInQuote.Add(exchangeFee.TakerFeeRate.Mul(quoteQuantity))
+		if !td.Fee.IsZero() {
+			if p.ExchangeFeeRates != nil {
+				if exchangeFee, ok := p.ExchangeFeeRates[td.Exchange]; ok {
+					if td.IsMaker {
+						feeInQuote = feeInQuote.Add(exchangeFee.MakerFeeRate.Mul(quoteQuantity))
+					} else {
+						feeInQuote = feeInQuote.Add(exchangeFee.TakerFeeRate.Mul(quoteQuantity))
+					}
 				}
-			}
-		} else if p.FeeRate != nil {
-			if td.IsMaker {
-				feeInQuote = feeInQuote.Add(p.FeeRate.MakerFeeRate.Mul(quoteQuantity))
-			} else {
-				feeInQuote = feeInQuote.Add(p.FeeRate.TakerFeeRate.Mul(quoteQuantity))
+			} else if p.FeeRate != nil {
+				if td.IsMaker {
+					feeInQuote = feeInQuote.Add(p.FeeRate.MakerFeeRate.Mul(quoteQuantity))
+				} else {
+					feeInQuote = feeInQuote.Add(p.FeeRate.TakerFeeRate.Mul(quoteQuantity))
+				}
 			}
 		}
 	}
@@ -352,6 +491,7 @@ func (p *Position) AddTrade(td Trade) (profit fixedpoint.Value, netProfit fixedp
 	switch td.Side {
 
 	case SideTypeBuy:
+		// was short position, now trade buy should cover the position
 		if p.Base.Sign() < 0 {
 			// convert short position to long position
 			if p.Base.Add(quantity).Sign() > 0 {
@@ -362,9 +502,10 @@ func (p *Position) AddTrade(td Trade) (profit fixedpoint.Value, netProfit fixedp
 				p.AverageCost = price
 				p.ApproximateAverageCost = price
 				p.AccumulatedProfit = p.AccumulatedProfit.Add(profit)
+				p.OpenedAt = td.Time.Time()
 				return profit, netProfit, true
 			} else {
-				// covering short position
+				// after adding quantity it's still short position
 				p.Base = p.Base.Add(quantity)
 				p.Quote = p.Quote.Sub(quoteQuantity)
 				profit = p.AverageCost.Sub(price).Mul(quantity)
@@ -374,6 +515,13 @@ func (p *Position) AddTrade(td Trade) (profit fixedpoint.Value, netProfit fixedp
 			}
 		}
 
+		// before adding the quantity, it's already a dust position
+		// then we should set the openedAt time
+		if p.IsDust(td.Price) {
+			p.OpenedAt = td.Time.Time()
+		}
+
+		// here the case is: base == 0 or base > 0
 		divisor := p.Base.Add(quantity)
 		p.ApproximateAverageCost = p.ApproximateAverageCost.Mul(p.Base).
 			Add(quoteQuantity).
@@ -382,10 +530,10 @@ func (p *Position) AddTrade(td Trade) (profit fixedpoint.Value, netProfit fixedp
 		p.AverageCost = p.AverageCost.Mul(p.Base).Add(quoteQuantity).Div(divisor)
 		p.Base = p.Base.Add(quantity)
 		p.Quote = p.Quote.Sub(quoteQuantity)
-
 		return fixedpoint.Zero, fixedpoint.Zero, false
 
 	case SideTypeSell:
+		// was long position, the sell trade should reduce the base amount
 		if p.Base.Sign() > 0 {
 			// convert long position to short position
 			if p.Base.Compare(quantity) < 0 {
@@ -396,6 +544,7 @@ func (p *Position) AddTrade(td Trade) (profit fixedpoint.Value, netProfit fixedp
 				p.AverageCost = price
 				p.ApproximateAverageCost = price
 				p.AccumulatedProfit = p.AccumulatedProfit.Add(profit)
+				p.OpenedAt = td.Time.Time()
 				return profit, netProfit, true
 			} else {
 				p.Base = p.Base.Sub(quantity)
@@ -405,6 +554,12 @@ func (p *Position) AddTrade(td Trade) (profit fixedpoint.Value, netProfit fixedp
 				p.AccumulatedProfit = p.AccumulatedProfit.Add(profit)
 				return profit, netProfit, true
 			}
+		}
+
+		// before subtracting the quantity, it's already a dust position
+		// then we should set the openedAt time
+		if p.IsDust(td.Price) {
+			p.OpenedAt = td.Time.Time()
 		}
 
 		// handling short position, since Base here is negative we need to reverse the sign

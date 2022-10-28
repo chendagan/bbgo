@@ -2,6 +2,7 @@ package xmaker
 
 import (
 	"sync"
+	"time"
 
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
@@ -9,12 +10,17 @@ import (
 
 type State struct {
 	CoveredPosition fixedpoint.Value `json:"coveredPosition,omitempty"`
-	Position        *types.Position  `json:"position,omitempty"`
-	ProfitStats     ProfitStats      `json:"profitStats,omitempty"`
+
+	// Deprecated:
+	Position *types.Position `json:"position,omitempty"`
+
+	// Deprecated:
+	ProfitStats ProfitStats `json:"profitStats,omitempty"`
 }
 
 type ProfitStats struct {
-	types.ProfitStats
+	*types.ProfitStats
+
 	lock sync.Mutex
 
 	MakerExchange types.ExchangeName `json:"makerExchange"`
@@ -52,7 +58,7 @@ func (s *ProfitStats) AddTrade(trade types.Trade) {
 }
 
 func (s *ProfitStats) ResetToday() {
-	s.ProfitStats.ResetToday()
+	s.ProfitStats.ResetToday(time.Now())
 
 	s.lock.Lock()
 	s.TodayMakerVolume = fixedpoint.Zero

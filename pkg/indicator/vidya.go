@@ -3,6 +3,7 @@ package indicator
 import (
 	"math"
 
+	"github.com/c9s/bbgo/pkg/datatype/floats"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -10,15 +11,17 @@ import (
 // Refer URL: https://metatrader5.com/en/terminal/help/indicators/trend_indicators/vida
 //go:generate callbackgen -type VIDYA
 type VIDYA struct {
+	types.SeriesBase
 	types.IntervalWindow
-	Values types.Float64Slice
-	input  types.Float64Slice
+	Values floats.Slice
+	input  floats.Slice
 
-	UpdateCallbacks []func(value float64)
+	updateCallbacks []func(value float64)
 }
 
 func (inc *VIDYA) Update(value float64) {
 	if inc.Values.Length() == 0 {
+		inc.SeriesBase.Series = inc
 		inc.Values.Push(value)
 		inc.input.Push(value)
 		return
@@ -66,16 +69,21 @@ func (inc *VIDYA) Length() int {
 	return inc.Values.Length()
 }
 
-var _ types.Series = &VIDYA{}
+var _ types.SeriesExtend = &VIDYA{}
 
-func (inc *VIDYA) calculateAndUpdate(allKLines []types.KLine) {
+func (inc *VIDYA) PushK(k types.KLine) {
+	inc.Update(k.Close.Float64())
+}
+
+func (inc *VIDYA) CalculateAndUpdate(allKLines []types.KLine) {
 	if inc.input.Length() == 0 {
 		for _, k := range allKLines {
-			inc.Update(k.Close.Float64())
+			inc.PushK(k)
 			inc.EmitUpdate(inc.Last())
 		}
 	} else {
-		inc.Update(allKLines[len(allKLines)-1].Close.Float64())
+		k := allKLines[len(allKLines)-1]
+		inc.PushK(k)
 		inc.EmitUpdate(inc.Last())
 	}
 }
@@ -85,7 +93,7 @@ func (inc *VIDYA) handleKLineWindowUpdate(interval types.Interval, window types.
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *VIDYA) Bind(updater KLineWindowUpdater) {

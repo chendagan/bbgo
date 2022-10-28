@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -54,9 +55,22 @@ var klineCmd = &cobra.Command{
 			return err
 		}
 
+		now := time.Now()
+		kLines, err := session.Exchange.QueryKLines(ctx, symbol, types.Interval(interval), types.KLineQueryOptions{
+			Limit:   50,
+			EndTime: &now,
+		})
+		if err != nil {
+			return err
+		}
+		log.Infof("kLines from RESTful API")
+		for _, k := range kLines {
+			log.Info(k.String())
+		}
+
 		s := session.Exchange.NewStream()
 		s.SetPublicOnly()
-		s.Subscribe(types.KLineChannel, symbol, types.SubscribeOptions{Interval: interval})
+		s.Subscribe(types.KLineChannel, symbol, types.SubscribeOptions{Interval: types.Interval(interval)})
 
 		s.OnKLineClosed(func(kline types.KLine) {
 			log.Infof("kline closed: %s", kline.String())

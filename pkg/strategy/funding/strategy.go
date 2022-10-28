@@ -3,7 +3,6 @@ package funding
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -27,13 +26,12 @@ func init() {
 }
 
 type Strategy struct {
-	*bbgo.Notifiability
 	// These fields will be filled from the config file (it translates YAML to JSON)
 	Symbol              string           `json:"symbol"`
 	Market              types.Market     `json:"-"`
 	Quantity            fixedpoint.Value `json:"quantity,omitempty"`
 	MaxExposurePosition fixedpoint.Value `json:"maxExposurePosition"`
-	//Interval            types.Interval   `json:"interval"`
+	// Interval            types.Interval   `json:"interval"`
 
 	FundingRate *struct {
 		High          fixedpoint.Value `json:"high"`
@@ -50,11 +48,11 @@ type Strategy struct {
 		// MovingAverageInterval is the interval of k-lines for the moving average indicator to calculate,
 		// it could be "1m", "5m", "1h" and so on.  note that, the moving averages are calculated from
 		// the k-line data we subscribed
-		//MovingAverageInterval types.Interval `json:"movingAverageInterval"`
+		// MovingAverageInterval types.Interval `json:"movingAverageInterval"`
 		//
-		//// MovingAverageWindow is the number of the window size of the moving average indicator.
-		//// The number of k-lines in the window. generally used window sizes are 7, 25 and 99 in the TradingView.
-		//MovingAverageWindow int `json:"movingAverageWindow"`
+		// // MovingAverageWindow is the number of the window size of the moving average indicator.
+		// // The number of k-lines in the window. generally used window sizes are 7, 25 and 99 in the TradingView.
+		// MovingAverageWindow int `json:"movingAverageWindow"`
 
 		MovingAverageIntervalWindow types.IntervalWindow `json:"movingAverageIntervalWindow"`
 
@@ -71,16 +69,16 @@ func (s *Strategy) ID() string {
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 	// session.Subscribe(types.BookChannel, s.Symbol, types.SubscribeOptions{})
 
-	//session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{
+	// session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{
 	//	Interval: string(s.Interval),
-	//})
+	// })
 
 	for _, detection := range s.SupportDetection {
 		session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{
-			Interval: string(detection.Interval),
+			Interval: detection.Interval,
 		})
 		session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{
-			Interval: string(detection.MovingAverageIntervalWindow.Interval),
+			Interval: detection.MovingAverageIntervalWindow.Interval,
 		})
 	}
 }
@@ -94,23 +92,13 @@ func (s *Strategy) Validate() error {
 }
 
 func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
+	standardIndicatorSet := session.StandardIndicatorSet(s.Symbol)
 
-	standardIndicatorSet, ok := session.StandardIndicatorSet(s.Symbol)
-	if !ok {
-		return fmt.Errorf("standardIndicatorSet is nil, symbol %s", s.Symbol)
-	}
-	//binanceExchange, ok := session.Exchange.(*binance.Exchange)
-	//if !ok {
-	//	log.Error("exchange failed")
-	//}
 	if !session.Futures {
 		log.Error("futures not enabled in config for this strategy")
 		return nil
 	}
 
-	//if s.FundingRate != nil {
-	//	go s.listenToFundingRate(ctx, binanceExchange)
-	//}
 	premiumIndex, err := session.Exchange.(*binance.Exchange).QueryPremiumIndex(ctx, s.Symbol)
 	if err != nil {
 		log.Error("exchange does not support funding rate api")
@@ -158,7 +146,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			fundingRate := premiumIndex.LastFundingRate
 
 			if fundingRate.Compare(s.FundingRate.High) >= 0 {
-				s.Notifiability.Notify("%s funding rate %s is too high! threshold %s",
+				bbgo.Notify("%s funding rate %s is too high! threshold %s",
 					s.Symbol,
 					fundingRate.Percentage(),
 					s.FundingRate.High.Percentage(),
@@ -172,13 +160,13 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			prettyQuoteVolume := s.Market.QuoteCurrencyFormatter()
 
 			if detection.MinVolume.Sign() > 0 && kline.Volume.Compare(detection.MinVolume) > 0 {
-				s.Notifiability.Notify("Detected %s %s resistance base volume %s > min base volume %s, quote volume %s",
+				bbgo.Notify("Detected %s %s resistance base volume %s > min base volume %s, quote volume %s",
 					s.Symbol, detection.Interval.String(),
 					prettyBaseVolume.FormatMoney(kline.Volume.Trunc()),
 					prettyBaseVolume.FormatMoney(detection.MinVolume.Trunc()),
 					prettyQuoteVolume.FormatMoney(kline.QuoteVolume.Trunc()),
 				)
-				s.Notifiability.Notify(kline)
+				bbgo.Notify(kline)
 
 				baseBalance, ok := session.GetAccount().Balance(s.Market.BaseCurrency)
 				if !ok {
@@ -198,13 +186,13 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 					}
 				}
 			} else if detection.MinQuoteVolume.Sign() > 0 && kline.QuoteVolume.Compare(detection.MinQuoteVolume) > 0 {
-				s.Notifiability.Notify("Detected %s %s resistance quote volume %s > min quote volume %s, base volume %s",
+				bbgo.Notify("Detected %s %s resistance quote volume %s > min quote volume %s, base volume %s",
 					s.Symbol, detection.Interval.String(),
 					prettyQuoteVolume.FormatMoney(kline.QuoteVolume.Trunc()),
 					prettyQuoteVolume.FormatMoney(detection.MinQuoteVolume.Trunc()),
 					prettyBaseVolume.FormatMoney(kline.Volume.Trunc()),
 				)
-				s.Notifiability.Notify(kline)
+				bbgo.Notify(kline)
 			}
 		}
 	})

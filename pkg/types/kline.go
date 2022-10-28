@@ -7,7 +7,7 @@ import (
 	"github.com/slack-go/slack"
 
 	"github.com/c9s/bbgo/pkg/fixedpoint"
-	"github.com/c9s/bbgo/pkg/util"
+	"github.com/c9s/bbgo/pkg/style"
 )
 
 type Direction int
@@ -71,37 +71,71 @@ type KLine struct {
 	Closed         bool   `json:"closed" db:"closed"`
 }
 
-func (k KLine) GetStartTime() Time {
+func (k *KLine) Set(o *KLine) {
+	k.GID = o.GID
+	k.Exchange = o.Exchange
+	k.Symbol = o.Symbol
+	k.StartTime = o.StartTime
+	k.EndTime = o.EndTime
+	k.Interval = o.Interval
+	k.Open = o.Open
+	k.Close = o.Close
+	k.High = o.High
+	k.Low = o.Low
+	k.Volume = o.Volume
+	k.QuoteVolume = o.QuoteVolume
+	k.TakerBuyBaseAssetVolume = o.TakerBuyBaseAssetVolume
+	k.TakerBuyQuoteAssetVolume = o.TakerBuyQuoteAssetVolume
+	k.LastTradeID = o.LastTradeID
+	k.NumberOfTrades = o.NumberOfTrades
+	k.Closed = o.Closed
+}
+
+func (k *KLine) Merge(o *KLine) {
+	k.EndTime = o.EndTime
+	k.Close = o.Close
+	k.High = fixedpoint.Max(k.High, o.High)
+	k.Low = fixedpoint.Min(k.Low, o.Low)
+	k.Volume = k.Volume.Add(o.Volume)
+	k.QuoteVolume = k.QuoteVolume.Add(o.QuoteVolume)
+	k.TakerBuyBaseAssetVolume = k.TakerBuyBaseAssetVolume.Add(o.TakerBuyBaseAssetVolume)
+	k.TakerBuyQuoteAssetVolume = k.TakerBuyQuoteAssetVolume.Add(o.TakerBuyQuoteAssetVolume)
+	k.LastTradeID = o.LastTradeID
+	k.NumberOfTrades += o.NumberOfTrades
+	k.Closed = o.Closed
+}
+
+func (k *KLine) GetStartTime() Time {
 	return k.StartTime
 }
 
-func (k KLine) GetEndTime() Time {
+func (k *KLine) GetEndTime() Time {
 	return k.EndTime
 }
 
-func (k KLine) GetInterval() Interval {
+func (k *KLine) GetInterval() Interval {
 	return k.Interval
 }
 
-func (k KLine) Mid() fixedpoint.Value {
+func (k *KLine) Mid() fixedpoint.Value {
 	return k.High.Add(k.Low).Div(Two)
 }
 
 // green candle with open and close near high price
-func (k KLine) BounceUp() bool {
+func (k *KLine) BounceUp() bool {
 	mid := k.Mid()
 	trend := k.Direction()
 	return trend > 0 && k.Open.Compare(mid) > 0 && k.Close.Compare(mid) > 0
 }
 
 // red candle with open and close near low price
-func (k KLine) BounceDown() bool {
+func (k *KLine) BounceDown() bool {
 	mid := k.Mid()
 	trend := k.Direction()
 	return trend > 0 && k.Open.Compare(mid) < 0 && k.Close.Compare(mid) < 0
 }
 
-func (k KLine) Direction() Direction {
+func (k *KLine) Direction() Direction {
 	o := k.GetOpen()
 	c := k.GetClose()
 
@@ -113,32 +147,32 @@ func (k KLine) Direction() Direction {
 	return DirectionNone
 }
 
-func (k KLine) GetHigh() fixedpoint.Value {
+func (k *KLine) GetHigh() fixedpoint.Value {
 	return k.High
 }
 
-func (k KLine) GetLow() fixedpoint.Value {
+func (k *KLine) GetLow() fixedpoint.Value {
 	return k.Low
 }
 
-func (k KLine) GetOpen() fixedpoint.Value {
+func (k *KLine) GetOpen() fixedpoint.Value {
 	return k.Open
 }
 
-func (k KLine) GetClose() fixedpoint.Value {
+func (k *KLine) GetClose() fixedpoint.Value {
 	return k.Close
 }
 
-func (k KLine) GetMaxChange() fixedpoint.Value {
+func (k *KLine) GetMaxChange() fixedpoint.Value {
 	return k.GetHigh().Sub(k.GetLow())
 }
 
-func (k KLine) GetAmplification() fixedpoint.Value {
+func (k *KLine) GetAmplification() fixedpoint.Value {
 	return k.GetMaxChange().Div(k.GetLow())
 }
 
 // GetThickness returns the thickness of the kline. 1 => thick, 0.1 => thin
-func (k KLine) GetThickness() fixedpoint.Value {
+func (k *KLine) GetThickness() fixedpoint.Value {
 	out := k.GetChange().Div(k.GetMaxChange())
 	if out.Sign() < 0 {
 		return out.Neg()
@@ -146,7 +180,7 @@ func (k KLine) GetThickness() fixedpoint.Value {
 	return out
 }
 
-func (k KLine) GetUpperShadowRatio() fixedpoint.Value {
+func (k *KLine) GetUpperShadowRatio() fixedpoint.Value {
 	out := k.GetUpperShadowHeight().Div(k.GetMaxChange())
 	if out.Sign() < 0 {
 		return out.Neg()
@@ -154,7 +188,7 @@ func (k KLine) GetUpperShadowRatio() fixedpoint.Value {
 	return out
 }
 
-func (k KLine) GetUpperShadowHeight() fixedpoint.Value {
+func (k *KLine) GetUpperShadowHeight() fixedpoint.Value {
 	high := k.GetHigh()
 	open := k.GetOpen()
 	clos := k.GetClose()
@@ -164,7 +198,7 @@ func (k KLine) GetUpperShadowHeight() fixedpoint.Value {
 	return high.Sub(clos)
 }
 
-func (k KLine) GetLowerShadowRatio() fixedpoint.Value {
+func (k *KLine) GetLowerShadowRatio() fixedpoint.Value {
 	out := k.GetLowerShadowHeight().Div(k.GetMaxChange())
 	if out.Sign() < 0 {
 		return out.Neg()
@@ -172,7 +206,7 @@ func (k KLine) GetLowerShadowRatio() fixedpoint.Value {
 	return out
 }
 
-func (k KLine) GetLowerShadowHeight() fixedpoint.Value {
+func (k *KLine) GetLowerShadowHeight() fixedpoint.Value {
 	low := k.Low
 	if k.Open.Compare(k.Close) < 0 { // uptrend
 		return k.Open.Sub(low)
@@ -183,63 +217,63 @@ func (k KLine) GetLowerShadowHeight() fixedpoint.Value {
 }
 
 // GetBody returns the height of the candle real body
-func (k KLine) GetBody() fixedpoint.Value {
+func (k *KLine) GetBody() fixedpoint.Value {
 	return k.GetChange()
 }
 
 // GetChange returns Close price - Open price.
-func (k KLine) GetChange() fixedpoint.Value {
+func (k *KLine) GetChange() fixedpoint.Value {
 	return k.Close.Sub(k.Open)
 }
 
-func (k KLine) Color() string {
+func (k *KLine) Color() string {
 	if k.Direction() > 0 {
-		return GreenColor
+		return style.GreenColor
 	} else if k.Direction() < 0 {
-		return RedColor
+		return style.RedColor
 	}
-	return GrayColor
+	return style.GrayColor
 }
 
-func (k KLine) String() string {
+func (k *KLine) String() string {
 	return fmt.Sprintf("%s %s %s %s O: %.4f H: %.4f L: %.4f C: %.4f CHG: %.4f MAXCHG: %.4f V: %.4f QV: %.2f TBBV: %.2f",
 		k.Exchange.String(),
 		k.StartTime.Time().Format("2006-01-02 15:04"),
 		k.Symbol, k.Interval, k.Open.Float64(), k.High.Float64(), k.Low.Float64(), k.Close.Float64(), k.GetChange().Float64(), k.GetMaxChange().Float64(), k.Volume.Float64(), k.QuoteVolume.Float64(), k.TakerBuyBaseAssetVolume.Float64())
 }
 
-func (k KLine) PlainText() string {
+func (k *KLine) PlainText() string {
 	return k.String()
 }
 
-func (k KLine) SlackAttachment() slack.Attachment {
+func (k *KLine) SlackAttachment() slack.Attachment {
 	return slack.Attachment{
 		Text:  fmt.Sprintf("*%s* KLine %s", k.Symbol, k.Interval),
 		Color: k.Color(),
 		Fields: []slack.AttachmentField{
-			{Title: "Open", Value: util.FormatValue(k.Open, 2), Short: true},
-			{Title: "High", Value: util.FormatValue(k.High, 2), Short: true},
-			{Title: "Low", Value: util.FormatValue(k.Low, 2), Short: true},
-			{Title: "Close", Value: util.FormatValue(k.Close, 2), Short: true},
-			{Title: "Mid", Value: util.FormatValue(k.Mid(), 2), Short: true},
-			{Title: "Change", Value: util.FormatValue(k.GetChange(), 2), Short: true},
-			{Title: "Volume", Value: util.FormatValue(k.Volume, 2), Short: true},
-			{Title: "Taker Buy Base Volume", Value: util.FormatValue(k.TakerBuyBaseAssetVolume, 2), Short: true},
-			{Title: "Taker Buy Quote Volume", Value: util.FormatValue(k.TakerBuyQuoteAssetVolume, 2), Short: true},
-			{Title: "Max Change", Value: util.FormatValue(k.GetMaxChange(), 2), Short: true},
+			{Title: "Open", Value: k.Open.FormatString(2), Short: true},
+			{Title: "High", Value: k.High.FormatString(2), Short: true},
+			{Title: "Low", Value: k.Low.FormatString(2), Short: true},
+			{Title: "Close", Value: k.Close.FormatString(2), Short: true},
+			{Title: "Mid", Value: k.Mid().FormatString(2), Short: true},
+			{Title: "Change", Value: k.GetChange().FormatString(2), Short: true},
+			{Title: "Volume", Value: k.Volume.FormatString(2), Short: true},
+			{Title: "Taker Buy Base Volume", Value: k.TakerBuyBaseAssetVolume.FormatString(2), Short: true},
+			{Title: "Taker Buy Quote Volume", Value: k.TakerBuyQuoteAssetVolume.FormatString(2), Short: true},
+			{Title: "Max Change", Value: k.GetMaxChange().FormatString(2), Short: true},
 			{
 				Title: "Thickness",
-				Value: util.FormatValue(k.GetThickness(), 4),
+				Value: k.GetThickness().FormatString(4),
 				Short: true,
 			},
 			{
 				Title: "UpperShadowRatio",
-				Value: util.FormatValue(k.GetUpperShadowRatio(), 4),
+				Value: k.GetUpperShadowRatio().FormatString(4),
 				Short: true,
 			},
 			{
 				Title: "LowerShadowRatio",
-				Value: util.FormatValue(k.GetLowerShadowRatio(), 4),
+				Value: k.GetLowerShadowRatio().FormatString(4),
 				Short: true,
 			},
 		},
@@ -278,7 +312,8 @@ func (k KLineWindow) GetInterval() Interval {
 }
 
 func (k KLineWindow) GetOpen() fixedpoint.Value {
-	return k.First().GetOpen()
+	first := k.First()
+	return first.GetOpen()
 }
 
 func (k KLineWindow) GetClose() fixedpoint.Value {
@@ -287,7 +322,8 @@ func (k KLineWindow) GetClose() fixedpoint.Value {
 }
 
 func (k KLineWindow) GetHigh() fixedpoint.Value {
-	high := k.First().GetHigh()
+	first := k.First()
+	high := first.GetHigh()
 	for _, line := range k {
 		high = fixedpoint.Max(high, line.GetHigh())
 	}
@@ -296,7 +332,8 @@ func (k KLineWindow) GetHigh() fixedpoint.Value {
 }
 
 func (k KLineWindow) GetLow() fixedpoint.Value {
-	low := k.First().GetLow()
+	first := k.First()
+	low := first.GetLow()
 	for _, line := range k {
 		low = fixedpoint.Min(low, line.GetLow())
 	}
@@ -348,11 +385,11 @@ func (k KLineWindow) GetTrend() int {
 
 func (k KLineWindow) Color() string {
 	if k.GetTrend() > 0 {
-		return GreenColor
+		return style.GreenColor
 	} else if k.GetTrend() < 0 {
-		return RedColor
+		return style.RedColor
 	}
-	return GrayColor
+	return style.GrayColor
 }
 
 // Mid price
@@ -471,34 +508,34 @@ func (k KLineWindow) SlackAttachment() slack.Attachment {
 		Text:  fmt.Sprintf("*%s* KLineWindow %s x %d", first.Symbol, first.Interval, windowSize),
 		Color: k.Color(),
 		Fields: []slack.AttachmentField{
-			{Title: "Open", Value: util.FormatValue(k.GetOpen(), 2), Short: true},
-			{Title: "High", Value: util.FormatValue(k.GetHigh(), 2), Short: true},
-			{Title: "Low", Value: util.FormatValue(k.GetLow(), 2), Short: true},
-			{Title: "Close", Value: util.FormatValue(k.GetClose(), 2), Short: true},
-			{Title: "Mid", Value: util.FormatValue(k.Mid(), 2), Short: true},
+			{Title: "Open", Value: k.GetOpen().FormatString(2), Short: true},
+			{Title: "High", Value: k.GetHigh().FormatString(2), Short: true},
+			{Title: "Low", Value: k.GetLow().FormatString(2), Short: true},
+			{Title: "Close", Value: k.GetClose().FormatString(2), Short: true},
+			{Title: "Mid", Value: k.Mid().FormatPercentage(2), Short: true},
 			{
 				Title: "Change",
-				Value: util.FormatValue(k.GetChange(), 2),
+				Value: k.GetChange().FormatString(2),
 				Short: true,
 			},
 			{
 				Title: "Max Change",
-				Value: util.FormatValue(k.GetMaxChange(), 2),
+				Value: k.GetMaxChange().FormatString(2),
 				Short: true,
 			},
 			{
 				Title: "Thickness",
-				Value: util.FormatValue(k.GetThickness(), 4),
+				Value: k.GetThickness().FormatString(4),
 				Short: true,
 			},
 			{
 				Title: "UpperShadowRatio",
-				Value: util.FormatValue(k.GetUpperShadowRatio(), 4),
+				Value: k.GetUpperShadowRatio().FormatString(4),
 				Short: true,
 			},
 			{
 				Title: "LowerShadowRatio",
-				Value: util.FormatValue(k.GetLowerShadowRatio(), 4),
+				Value: k.GetLowerShadowRatio().FormatString(4),
 				Short: true,
 			},
 		},
@@ -563,6 +600,8 @@ type KLineSeries struct {
 func (k *KLineSeries) Last() float64 {
 	length := len(*k.lines)
 	switch k.kv {
+	case kOpUnknown:
+		panic("kline series operator unknown")
 	case kOpenValue:
 		return (*k.lines)[length-1].GetOpen().Float64()
 	case kCloseValue:
@@ -602,3 +641,14 @@ func (k *KLineSeries) Length() int {
 }
 
 var _ Series = &KLineSeries{}
+
+type KLineCallBack func(k KLine)
+
+func KLineWith(symbol string, interval Interval, callback KLineCallBack) KLineCallBack {
+	return func(k KLine) {
+		if k.Symbol != symbol || (k.Interval != "" && k.Interval != interval) {
+			return
+		}
+		callback(k)
+	}
+}

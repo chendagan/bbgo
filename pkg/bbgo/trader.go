@@ -11,17 +11,41 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"github.com/c9s/bbgo/pkg/dynamic"
 	"github.com/c9s/bbgo/pkg/interact"
 )
 
+// Strategy method calls:
+// -> Defaults()   (optional method)
+// -> Initialize()   (optional method)
+// -> Validate()     (optional method)
+// -> Run()          (optional method)
+// -> Shutdown(shutdownCtx context.Context, wg *sync.WaitGroup)
+type StrategyID interface {
+	ID() string
+}
+
 // SingleExchangeStrategy represents the single Exchange strategy
 type SingleExchangeStrategy interface {
-	ID() string
+	StrategyID
 	Run(ctx context.Context, orderExecutor OrderExecutor, session *ExchangeSession) error
 }
 
+// StrategyInitializer's Initialize method is called before the Subscribe method call.
 type StrategyInitializer interface {
 	Initialize() error
+}
+
+type StrategyDefaulter interface {
+	Defaults() error
+}
+
+type StrategyValidator interface {
+	Validate() error
+}
+
+type StrategyShutdown interface {
+	Shutdown(ctx context.Context, wg *sync.WaitGroup)
 }
 
 // ExchangeSessionSubscriber provides an interface for collecting subscriptions from different strategies
@@ -35,26 +59,8 @@ type CrossExchangeSessionSubscriber interface {
 }
 
 type CrossExchangeStrategy interface {
-	ID() string
+	StrategyID
 	CrossRun(ctx context.Context, orderExecutionRouter OrderExecutionRouter, sessions map[string]*ExchangeSession) error
-}
-
-type Validator interface {
-	Validate() error
-}
-
-//go:generate callbackgen -type Graceful
-type Graceful struct {
-	shutdownCallbacks []func(ctx context.Context, wg *sync.WaitGroup)
-}
-
-func (g *Graceful) Shutdown(ctx context.Context) {
-	var wg sync.WaitGroup
-	wg.Add(len(g.shutdownCallbacks))
-
-	go g.EmitShutdown(ctx, &wg)
-
-	wg.Wait()
 }
 
 type Logging interface {
@@ -82,9 +88,9 @@ type Trader struct {
 	crossExchangeStrategies []CrossExchangeStrategy
 	exchangeStrategies      map[string][]SingleExchangeStrategy
 
-	logger Logger
+	gracefulShutdown GracefulShutdown
 
-	Graceful Graceful
+	logger Logger
 }
 
 func NewTrader(environ *Environment) *Trader {
@@ -122,20 +128,6 @@ func (trader *Trader) Configure(userConfig *Config) error {
 		trader.AttachCrossExchangeStrategy(strategy)
 	}
 
-	for _, report := range userConfig.PnLReporters {
-		if len(report.AverageCostBySymbols) > 0 {
-
-			log.Infof("setting up average cost pnl reporter on symbols: %v", report.AverageCostBySymbols)
-			trader.ReportPnL().
-				AverageCostBySymbols(report.AverageCostBySymbols...).
-				Of(report.Of...).
-				When(report.When...)
-
-		} else {
-			return fmt.Errorf("unsupported PnL reporter: %+v", report)
-		}
-	}
-
 	return nil
 }
 
@@ -155,9 +147,8 @@ func (trader *Trader) AttachStrategyOn(session string, strategies ...SingleExcha
 		return fmt.Errorf("session %s is not defined, valid sessions are: %v", session, keys)
 	}
 
-	for _, s := range strategies {
-		trader.exchangeStrategies[session] = append(trader.exchangeStrategies[session], s)
-	}
+	trader.exchangeStrategies[session] = append(
+		trader.exchangeStrategies[session], strategies...)
 
 	return nil
 }
@@ -180,6 +171,12 @@ func (trader *Trader) Subscribe() {
 	for sessionName, strategies := range trader.exchangeStrategies {
 		session := trader.environment.sessions[sessionName]
 		for _, strategy := range strategies {
+			if defaulter, ok := strategy.(StrategyDefaulter); ok {
+				if err := defaulter.Defaults(); err != nil {
+					panic(err)
+				}
+			}
+
 			if initializer, ok := strategy.(StrategyInitializer); ok {
 				if err := initializer.Initialize(); err != nil {
 					panic(err)
@@ -195,6 +192,12 @@ func (trader *Trader) Subscribe() {
 	}
 
 	for _, strategy := range trader.crossExchangeStrategies {
+		if defaulter, ok := strategy.(StrategyDefaulter); ok {
+			if err := defaulter.Defaults(); err != nil {
+				panic(err)
+			}
+		}
+
 		if initializer, ok := strategy.(StrategyInitializer); ok {
 			if err := initializer.Initialize(); err != nil {
 				panic(err)
@@ -210,57 +213,14 @@ func (trader *Trader) Subscribe() {
 }
 
 func (trader *Trader) RunSingleExchangeStrategy(ctx context.Context, strategy SingleExchangeStrategy, session *ExchangeSession, orderExecutor OrderExecutor) error {
-	rs := reflect.ValueOf(strategy)
-
-	// get the struct element
-	rs = rs.Elem()
-
-	if rs.Kind() != reflect.Struct {
-		return errors.New("strategy object is not a struct")
-	}
-
-	if err := trader.injectCommonServices(strategy); err != nil {
-		return err
-	}
-
-	if err := injectField(rs, "OrderExecutor", orderExecutor, false); err != nil {
-		return errors.Wrapf(err, "failed to inject OrderExecutor on %T", strategy)
-	}
-
-	if symbol, ok := isSymbolBasedStrategy(rs); ok {
-		log.Infof("found symbol based strategy from %s", rs.Type())
-
-		market, ok := session.Market(symbol)
-		if !ok {
-			return fmt.Errorf("market of symbol %s not found", symbol)
-		}
-
-		indicatorSet, ok := session.StandardIndicatorSet(symbol)
-		if !ok {
-			return fmt.Errorf("standardIndicatorSet of symbol %s not found", symbol)
-		}
-
-		store, ok := session.MarketDataStore(symbol)
-		if !ok {
-			return fmt.Errorf("marketDataStore of symbol %s not found", symbol)
-		}
-
-		if err := parseStructAndInject(strategy,
-			market,
-			indicatorSet,
-			store,
-			session,
-			session.OrderExecutor,
-		); err != nil {
-			return errors.Wrapf(err, "failed to inject object into %T", strategy)
-		}
-	}
-
-	// If the strategy has Validate() method, run it and check the error
-	if v, ok := strategy.(Validator); ok {
+	if v, ok := strategy.(StrategyValidator); ok {
 		if err := v.Validate(); err != nil {
 			return fmt.Errorf("failed to validate the config: %w", err)
 		}
+	}
+
+	if shutdown, ok := strategy.(StrategyShutdown); ok {
+		trader.gracefulShutdown.OnShutdown(shutdown.Shutdown)
 	}
 
 	return strategy.Run(ctx, orderExecutor, session)
@@ -302,30 +262,58 @@ func (trader *Trader) RunAllSingleExchangeStrategy(ctx context.Context) error {
 	return nil
 }
 
-func (trader *Trader) Run(ctx context.Context) error {
-	// before we start the interaction,
-	// register the core interaction, because we can only get the strategies in this scope
-	// trader.environment.Connect will call interact.Start
-	interact.AddCustomInteraction(NewCoreInteraction(trader.environment, trader))
+func (trader *Trader) injectFields() error {
+	// load and run Session strategies
+	for sessionName, strategies := range trader.exchangeStrategies {
+		var session = trader.environment.sessions[sessionName]
+		var orderExecutor = trader.getSessionOrderExecutor(sessionName)
+		for _, strategy := range strategies {
+			rs := reflect.ValueOf(strategy)
 
-	trader.Subscribe()
+			// get the struct element
+			rs = rs.Elem()
 
-	if err := trader.environment.Start(ctx); err != nil {
-		return err
-	}
+			if rs.Kind() != reflect.Struct {
+				return errors.New("strategy object is not a struct")
+			}
 
-	if err := trader.RunAllSingleExchangeStrategy(ctx); err != nil {
-		return err
-	}
+			if err := trader.injectCommonServices(strategy); err != nil {
+				return err
+			}
 
-	router := &ExchangeOrderExecutionRouter{
-		Notifiability: trader.environment.Notifiability,
-		sessions:      trader.environment.sessions,
-		executors:     make(map[string]OrderExecutor),
-	}
-	for sessionID := range trader.environment.sessions {
-		var orderExecutor = trader.getSessionOrderExecutor(sessionID)
-		router.executors[sessionID] = orderExecutor
+			if err := dynamic.InjectField(rs, "OrderExecutor", orderExecutor, false); err != nil {
+				return errors.Wrapf(err, "failed to inject OrderExecutor on %T", strategy)
+			}
+
+			if symbol, ok := dynamic.LookupSymbolField(rs); ok {
+				log.Infof("found symbol based strategy from %s", rs.Type())
+
+				market, ok := session.Market(symbol)
+				if !ok {
+					return fmt.Errorf("market of symbol %s not found", symbol)
+				}
+
+				indicatorSet := session.StandardIndicatorSet(symbol)
+				if !ok {
+					return fmt.Errorf("standardIndicatorSet of symbol %s not found", symbol)
+				}
+
+				store, ok := session.MarketDataStore(symbol)
+				if !ok {
+					return fmt.Errorf("marketDataStore of symbol %s not found", symbol)
+				}
+
+				if err := dynamic.ParseStructAndInject(strategy,
+					market,
+					session,
+					session.OrderExecutor,
+					indicatorSet,
+					store,
+				); err != nil {
+					return errors.Wrapf(err, "failed to inject object into %T", strategy)
+				}
+			}
+		}
 	}
 
 	for _, strategy := range trader.crossExchangeStrategies {
@@ -340,7 +328,41 @@ func (trader *Trader) Run(ctx context.Context) error {
 		if err := trader.injectCommonServices(strategy); err != nil {
 			return err
 		}
+	}
 
+	return nil
+}
+
+func (trader *Trader) Run(ctx context.Context) error {
+	// before we start the interaction,
+	// register the core interaction, because we can only get the strategies in this scope
+	// trader.environment.Connect will call interact.Start
+	interact.AddCustomInteraction(NewCoreInteraction(trader.environment, trader))
+
+	if err := trader.injectFields(); err != nil {
+		return err
+	}
+
+	trader.Subscribe()
+
+	if err := trader.environment.Start(ctx); err != nil {
+		return err
+	}
+
+	if err := trader.RunAllSingleExchangeStrategy(ctx); err != nil {
+		return err
+	}
+
+	router := &ExchangeOrderExecutionRouter{
+		sessions:  trader.environment.sessions,
+		executors: make(map[string]OrderExecutor),
+	}
+	for sessionID := range trader.environment.sessions {
+		var orderExecutor = trader.getSessionOrderExecutor(sessionID)
+		router.executors[sessionID] = orderExecutor
+	}
+
+	for _, strategy := range trader.crossExchangeStrategies {
 		if err := strategy.CrossRun(ctx, router, trader.environment.sessions); err != nil {
 			return err
 		}
@@ -349,22 +371,74 @@ func (trader *Trader) Run(ctx context.Context) error {
 	return trader.environment.Connect(ctx)
 }
 
-var defaultPersistenceSelector = &PersistenceSelector{
-	StoreID: "default",
-	Type:    "memory",
+func (trader *Trader) LoadState() error {
+	if trader.environment.BacktestService != nil {
+		return nil
+	}
+
+	if persistenceServiceFacade == nil {
+		return nil
+	}
+
+	ps := persistenceServiceFacade.Get()
+
+	log.Infof("loading strategies states...")
+
+	return trader.IterateStrategies(func(strategy StrategyID) error {
+		id := dynamic.CallID(strategy)
+		return loadPersistenceFields(strategy, id, ps)
+	})
+}
+
+func (trader *Trader) IterateStrategies(f func(st StrategyID) error) error {
+	for _, strategies := range trader.exchangeStrategies {
+		for _, strategy := range strategies {
+			if err := f(strategy); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, strategy := range trader.crossExchangeStrategies {
+		if err := f(strategy); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (trader *Trader) SaveState() error {
+	if trader.environment.BacktestService != nil {
+		return nil
+	}
+
+	if persistenceServiceFacade == nil {
+		return nil
+	}
+
+	ps := persistenceServiceFacade.Get()
+
+	log.Infof("saving strategies states...")
+	return trader.IterateStrategies(func(strategy StrategyID) error {
+		id := dynamic.CallID(strategy)
+		if len(id) == 0 {
+			return nil
+		}
+
+		return storePersistenceFields(strategy, id, ps)
+	})
+}
+
+func (trader *Trader) Shutdown(ctx context.Context) {
+	trader.gracefulShutdown.Shutdown(ctx)
 }
 
 func (trader *Trader) injectCommonServices(s interface{}) error {
-	persistenceFacade := trader.environment.PersistenceServiceFacade
-	persistence := &Persistence{
-		PersistenceSelector: defaultPersistenceSelector,
-		Facade:              persistenceFacade,
-	}
-
 	// a special injection for persistence selector:
 	// if user defined the selector, the facade pointer will be nil, hence we need to update the persistence facade pointer
 	sv := reflect.ValueOf(s).Elem()
-	if field, ok := hasField(sv, "Persistence"); ok {
+	if field, ok := dynamic.HasField(sv, "Persistence"); ok {
 		// the selector is set, but we need to update the facade pointer
 		if !field.IsNil() {
 			elem := field.Elem()
@@ -372,33 +446,26 @@ func (trader *Trader) injectCommonServices(s interface{}) error {
 				return fmt.Errorf("field Persistence is not a struct element, %s given", field)
 			}
 
-			if err := injectField(elem, "Facade", persistenceFacade, true); err != nil {
+			if err := dynamic.InjectField(elem, "Facade", persistenceServiceFacade, true); err != nil {
 				return err
 			}
 
 			/*
-				if err := parseStructAndInject(field.Interface(), persistenceFacade); err != nil {
+				if err := ParseStructAndInject(field.Interface(), persistenceFacade); err != nil {
 					return err
 				}
 			*/
 		}
 	}
 
-	return parseStructAndInject(s,
-		&trader.Graceful,
+	return dynamic.ParseStructAndInject(s,
 		&trader.logger,
-		&trader.environment.Notifiability,
+		Notification,
 		trader.environment.TradeService,
 		trader.environment.OrderService,
 		trader.environment.DatabaseService,
 		trader.environment.AccountService,
 		trader.environment,
-		persistence,
-		persistenceFacade, // if the strategy use persistence facade separately
+		persistenceServiceFacade, // if the strategy use persistence facade separately
 	)
-}
-
-// ReportPnL configure and set the PnLReporter with the given notifier
-func (trader *Trader) ReportPnL() *PnLReporterManager {
-	return NewPnLReporter(&trader.environment.Notifiability)
 }

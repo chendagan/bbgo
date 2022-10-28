@@ -3,9 +3,7 @@ package indicator
 import (
 	"time"
 
-	log "github.com/sirupsen/logrus"
-	"gonum.org/v1/gonum/stat"
-
+	"github.com/c9s/bbgo/pkg/datatype/floats"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -26,13 +24,14 @@ Bollinger Bands Technical indicator guide:
 type BOLL struct {
 	types.IntervalWindow
 
-	// times of Std, generally it's 2
+	// K is the multiplier of Std, generally it's 2
 	K float64
 
-	SMA      types.Float64Slice
-	StdDev   types.Float64Slice
-	UpBand   types.Float64Slice
-	DownBand types.Float64Slice
+	SMA    *SMA
+	StdDev *StdDev
+
+	UpBand   floats.Slice
+	DownBand floats.Slice
 
 	EndTime time.Time
 
@@ -41,20 +40,20 @@ type BOLL struct {
 
 type BandType int
 
-func (inc *BOLL) GetUpBand() types.Series {
-	return &inc.UpBand
+func (inc *BOLL) GetUpBand() types.SeriesExtend {
+	return types.NewSeries(&inc.UpBand)
 }
 
-func (inc *BOLL) GetDownBand() types.Series {
-	return &inc.DownBand
+func (inc *BOLL) GetDownBand() types.SeriesExtend {
+	return types.NewSeries(&inc.DownBand)
 }
 
-func (inc *BOLL) GetSMA() types.Series {
-	return &inc.SMA
+func (inc *BOLL) GetSMA() types.SeriesExtend {
+	return types.NewSeries(inc.SMA)
 }
 
-func (inc *BOLL) GetStdDev() types.Series {
-	return &inc.StdDev
+func (inc *BOLL) GetStdDev() types.SeriesExtend {
+	return inc.StdDev
 }
 
 func (inc *BOLL) LastUpBand() float64 {
@@ -73,64 +72,58 @@ func (inc *BOLL) LastDownBand() float64 {
 	return inc.DownBand[len(inc.DownBand)-1]
 }
 
-func (inc *BOLL) LastStdDev() float64 {
-	if len(inc.StdDev) == 0 {
-		return 0.0
+func (inc *BOLL) Update(value float64) {
+	if inc.SMA == nil {
+		inc.SMA = &SMA{IntervalWindow: inc.IntervalWindow}
 	}
 
-	return inc.StdDev[len(inc.StdDev)-1]
-}
-
-func (inc *BOLL) LastSMA() float64 {
-	if len(inc.SMA) > 0 {
-		return inc.SMA[len(inc.SMA)-1]
-	}
-	return 0.0
-}
-
-func (inc *BOLL) calculateAndUpdate(kLines []types.KLine) {
-	if len(kLines) < inc.Window {
-		return
+	if inc.StdDev == nil {
+		inc.StdDev = &StdDev{IntervalWindow: inc.IntervalWindow}
 	}
 
-	var index = len(kLines) - 1
-	var kline = kLines[index]
+	inc.SMA.Update(value)
+	inc.StdDev.Update(value)
 
-	if inc.EndTime != zeroTime && kline.EndTime.Before(inc.EndTime) {
-		return
-	}
-
-	var recentK = kLines[index-(inc.Window-1) : index+1]
-	sma, err := calculateSMA(recentK, inc.Window, KLineClosePriceMapper)
-	if err != nil {
-		log.WithError(err).Error("SMA error")
-		return
-	}
-
-	inc.SMA.Push(sma)
-
-	var prices []float64
-	for _, k := range recentK {
-		prices = append(prices, k.Close.Float64())
-	}
-
-	var std = stat.StdDev(prices, nil)
-	inc.StdDev.Push(std)
-
-	var band = inc.K * std
+	var sma = inc.SMA.Last()
+	var stdDev = inc.StdDev.Last()
+	var band = inc.K * stdDev
 
 	var upBand = sma + band
-	inc.UpBand.Push(upBand)
-
 	var downBand = sma - band
+
+	inc.UpBand.Push(upBand)
 	inc.DownBand.Push(downBand)
+}
 
-	// update end time
-	inc.EndTime = kLines[index].EndTime.Time()
+func (inc *BOLL) BindK(target KLineClosedEmitter, symbol string, interval types.Interval) {
+	target.OnKLineClosed(types.KLineWith(symbol, interval, inc.PushK))
+}
 
-	// log.Infof("update boll: sma=%f, up=%f, down=%f", sma, upBand, downBand)
+func (inc *BOLL) PushK(k types.KLine) {
+	if inc.EndTime != zeroTime && k.EndTime.Before(inc.EndTime) {
+		return
+	}
+	inc.Update(k.Close.Float64())
+	inc.EndTime = k.EndTime.Time()
+	inc.EmitUpdate(inc.SMA.Last(), inc.UpBand.Last(), inc.DownBand.Last())
+}
 
-	inc.EmitUpdate(sma, upBand, downBand)
+func (inc *BOLL) LoadK(allKLines []types.KLine) {
+	for _, k := range allKLines {
+		inc.PushK(k)
+	}
+
+	inc.EmitUpdate(inc.SMA.Last(), inc.UpBand.Last(), inc.DownBand.Last())
+}
+
+func (inc *BOLL) CalculateAndUpdate(allKLines []types.KLine) {
+	if inc.SMA == nil {
+		inc.LoadK(allKLines)
+		return
+	}
+
+	var last = allKLines[len(allKLines)-1]
+	inc.PushK(last)
 }
 
 func (inc *BOLL) handleKLineWindowUpdate(interval types.Interval, window types.KLineWindow) {
@@ -142,7 +135,7 @@ func (inc *BOLL) handleKLineWindowUpdate(interval types.Interval, window types.K
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *BOLL) Bind(updater KLineWindowUpdater) {

@@ -8,11 +8,14 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 
 	"github.com/c9s/bbgo/pkg/exchange/okex/okexapi"
-	"github.com/c9s/bbgo/pkg/types"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
+	"github.com/c9s/bbgo/pkg/types"
 )
+
+var marketDataLimiter = rate.NewLimiter(rate.Every(time.Second/10), 1)
 
 // OKB is the platform currency of OKEx, pre-allocate static string here
 const OKB = "OKB"
@@ -35,7 +38,8 @@ func New(key, secret, passphrase string) *Exchange {
 	}
 
 	return &Exchange{
-		key:        key,
+		key: key,
+		// pragma: allowlist nextline secret
 		secret:     secret,
 		passphrase: passphrase,
 		client:     client,
@@ -155,78 +159,97 @@ func (e *Exchange) QueryAccountBalances(ctx context.Context) (types.BalanceMap, 
 	return balanceMap, nil
 }
 
-func (e *Exchange) SubmitOrders(ctx context.Context, orders ...types.SubmitOrder) (createdOrders types.OrderSlice, err error) {
-	var reqs []*okexapi.PlaceOrderRequest
-	for _, order := range orders {
-		orderReq := e.client.TradeService.NewPlaceOrderRequest()
+func (e *Exchange) SubmitOrder(ctx context.Context, order types.SubmitOrder) (*types.Order, error) {
+	orderReq := e.client.TradeService.NewPlaceOrderRequest()
 
-		orderType, err := toLocalOrderType(order.Type)
-		if err != nil {
-			return nil, err
-		}
-
-		orderReq.InstrumentID(toLocalSymbol(order.Symbol))
-		orderReq.Side(toLocalSideType(order.Side))
-
-		if order.Market.Symbol != "" {
-			orderReq.Quantity(order.Market.FormatQuantity(order.Quantity))
-		} else {
-			// TODO report error
-			orderReq.Quantity(order.Quantity.FormatString(8))
-		}
-
-		// set price field for limit orders
-		switch order.Type {
-		case types.OrderTypeStopLimit, types.OrderTypeLimit:
-			if order.Market.Symbol != "" {
-				orderReq.Price(order.Market.FormatPrice(order.Price))
-			} else {
-				// TODO report error
-				orderReq.Price(order.Price.FormatString(8))
-			}
-		}
-
-		switch order.TimeInForce {
-		case "FOK":
-			orderReq.OrderType(okexapi.OrderTypeFOK)
-		case "IOC":
-			orderReq.OrderType(okexapi.OrderTypeIOC)
-		default:
-			orderReq.OrderType(orderType)
-		}
-
-		reqs = append(reqs, orderReq)
-	}
-
-	batchReq := e.client.TradeService.NewBatchPlaceOrderRequest()
-	batchReq.Add(reqs...)
-	orderHeads, err := batchReq.Do(ctx)
+	orderType, err := toLocalOrderType(order.Type)
 	if err != nil {
 		return nil, err
 	}
 
-	for idx, orderHead := range orderHeads {
-		orderID, err := strconv.ParseInt(orderHead.OrderID, 10, 64)
-		if err != nil {
-			return createdOrders, err
-		}
+	orderReq.InstrumentID(toLocalSymbol(order.Symbol))
+	orderReq.Side(toLocalSideType(order.Side))
 
-		submitOrder := orders[idx]
-		createdOrders = append(createdOrders, types.Order{
-			SubmitOrder:      submitOrder,
-			Exchange:         types.ExchangeOKEx,
-			OrderID:          uint64(orderID),
-			Status:           types.OrderStatusNew,
-			ExecutedQuantity: fixedpoint.Zero,
-			IsWorking:        true,
-			CreationTime:     types.Time(time.Now()),
-			UpdateTime:       types.Time(time.Now()),
-			IsMargin:         false,
-			IsIsolated:       false,
-		})
+	if order.Market.Symbol != "" {
+		orderReq.Quantity(order.Market.FormatQuantity(order.Quantity))
+	} else {
+		// TODO report error
+		orderReq.Quantity(order.Quantity.FormatString(8))
 	}
 
-	return createdOrders, nil
+	// set price field for limit orders
+	switch order.Type {
+	case types.OrderTypeStopLimit, types.OrderTypeLimit:
+		if order.Market.Symbol != "" {
+			orderReq.Price(order.Market.FormatPrice(order.Price))
+		} else {
+			// TODO report error
+			orderReq.Price(order.Price.FormatString(8))
+		}
+	}
+
+	switch order.TimeInForce {
+	case "FOK":
+		orderReq.OrderType(okexapi.OrderTypeFOK)
+	case "IOC":
+		orderReq.OrderType(okexapi.OrderTypeIOC)
+	default:
+		orderReq.OrderType(orderType)
+	}
+
+	orderHead, err := orderReq.Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	orderID, err := strconv.ParseInt(orderHead.OrderID, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	return &types.Order{
+		SubmitOrder:      order,
+		Exchange:         types.ExchangeOKEx,
+		OrderID:          uint64(orderID),
+		Status:           types.OrderStatusNew,
+		ExecutedQuantity: fixedpoint.Zero,
+		IsWorking:        true,
+		CreationTime:     types.Time(time.Now()),
+		UpdateTime:       types.Time(time.Now()),
+		IsMargin:         false,
+		IsIsolated:       false,
+	}, nil
+
+	// TODO: move this to batch place orders interface
+	/*
+		batchReq := e.client.TradeService.NewBatchPlaceOrderRequest()
+		batchReq.Add(reqs...)
+		orderHeads, err := batchReq.Do(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		for idx, orderHead := range orderHeads {
+			orderID, err := strconv.ParseInt(orderHead.OrderID, 10, 64)
+			if err != nil {
+				return createdOrder, err
+			}
+
+			submitOrder := order[idx]
+			createdOrder = append(createdOrder, types.Order{
+				SubmitOrder:      submitOrder,
+				Exchange:         types.ExchangeOKEx,
+				OrderID:          uint64(orderID),
+				Status:           types.OrderStatusNew,
+				ExecutedQuantity: fixedpoint.Zero,
+				IsWorking:        true,
+				CreationTime:     types.Time(time.Now()),
+				UpdateTime:       types.Time(time.Now()),
+				IsMargin:         false,
+				IsIsolated:       false,
+			})
+		}
+	*/
 }
 
 func (e *Exchange) QueryOpenOrders(ctx context.Context, symbol string) (orders []types.Order, err error) {
@@ -272,15 +295,21 @@ func (e *Exchange) NewStream() types.Stream {
 }
 
 func (e *Exchange) QueryKLines(ctx context.Context, symbol string, interval types.Interval, options types.KLineQueryOptions) ([]types.KLine, error) {
+	if err := marketDataLimiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	intervalParam := toLocalInterval(interval.String())
+
 	req := e.client.MarketDataService.NewCandlesticksRequest(toLocalSymbol(symbol))
-	req.Bar(interval.String())
+	req.Bar(intervalParam)
 
 	if options.StartTime != nil {
-		req.After(options.StartTime.UnixNano() / int64(time.Millisecond))
+		req.After(options.StartTime.Unix())
 	}
 
 	if options.EndTime != nil {
-		req.Before(options.EndTime.UnixNano() / int64(time.Millisecond))
+		req.Before(options.EndTime.Unix())
 	}
 
 	candles, err := req.Do(ctx)

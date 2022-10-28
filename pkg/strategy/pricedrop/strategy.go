@@ -35,7 +35,7 @@ func (s *Strategy) ID() string {
 }
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
-	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: string(s.Interval)})
+	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.Interval})
 }
 
 func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
@@ -53,7 +53,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		return fmt.Errorf("market %s is not defined", s.Symbol)
 	}
 
-	standardIndicatorSet, ok := session.StandardIndicatorSet(s.Symbol)
+	standardIndicatorSet := session.StandardIndicatorSet(s.Symbol)
 	if !ok {
 		return fmt.Errorf("standardIndicatorSet is nil, symbol %s", s.Symbol)
 	}

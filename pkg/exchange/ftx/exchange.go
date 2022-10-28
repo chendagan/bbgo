@@ -30,14 +30,17 @@ var logger = logrus.WithField("exchange", "ftx")
 // POST https://ftx.com/api/orders 429, Success: false, err: Do not send more than 2 orders on this market per 200ms
 var requestLimit = rate.NewLimiter(rate.Every(220*time.Millisecond), 2)
 
+var marketDataLimiter = rate.NewLimiter(rate.Every(500*time.Millisecond), 2)
+
 //go:generate go run generate_symbol_map.go
 
 type Exchange struct {
 	client *ftxapi.RestClient
 
-	key, secret  string
-	subAccount   string
-	restEndpoint *url.URL
+	key, secret             string
+	subAccount              string
+	restEndpoint            *url.URL
+	orderAmountReduceFactor fixedpoint.Value
 }
 
 type MarketTicker struct {
@@ -88,8 +91,10 @@ func NewExchange(key, secret string, subAccount string) *Exchange {
 		client:       client,
 		restEndpoint: u,
 		key:          key,
-		secret:       secret,
-		subAccount:   subAccount,
+		// pragma: allowlist nextline secret
+		secret:                  secret,
+		subAccount:              subAccount,
+		orderAmountReduceFactor: fixedpoint.One,
 	}
 }
 
@@ -209,15 +214,32 @@ func (e *Exchange) QueryAccountBalances(ctx context.Context) (types.BalanceMap, 
 	return balances, nil
 }
 
+// DefaultFeeRates returns the FTX Tier 1 fee
+// See also https://help.ftx.com/hc/en-us/articles/360024479432-Fees
+func (e *Exchange) DefaultFeeRates() types.ExchangeFee {
+	return types.ExchangeFee{
+		MakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.020), // 0.020%
+		TakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.070), // 0.070%
+	}
+}
+
+// SetModifyOrderAmountForFee protects the limit buy orders by reducing amount with taker fee.
+// The amount is recalculated before submit: submit_amount = original_amount / (1 + taker_fee_rate) .
+// This prevents balance exceeding error while closing position without spot margin enabled.
+func (e *Exchange) SetModifyOrderAmountForFee(feeRate types.ExchangeFee) {
+	e.orderAmountReduceFactor = fixedpoint.One.Add(feeRate.TakerFeeRate)
+}
+
 // resolution field in api
 // window length in seconds. options: 15, 60, 300, 900, 3600, 14400, 86400, or any multiple of 86400 up to 30*86400
 var supportedIntervals = map[types.Interval]int{
-	types.Interval1m:  1,
-	types.Interval5m:  5,
-	types.Interval15m: 15,
-	types.Interval1h:  60,
-	types.Interval1d:  60 * 24,
-	types.Interval3d:  60 * 24 * 3,
+	types.Interval1m:  1 * 60,
+	types.Interval5m:  5 * 60,
+	types.Interval15m: 15 * 60,
+	types.Interval1h:  60 * 60,
+	types.Interval4h:  60 * 60 * 4,
+	types.Interval1d:  60 * 60 * 24,
+	types.Interval3d:  60 * 60 * 24 * 3,
 }
 
 func (e *Exchange) SupportedInterval() map[types.Interval]int {
@@ -230,94 +252,45 @@ func (e *Exchange) IsSupportedInterval(interval types.Interval) bool {
 
 func (e *Exchange) QueryKLines(ctx context.Context, symbol string, interval types.Interval, options types.KLineQueryOptions) ([]types.KLine, error) {
 	var klines []types.KLine
-	var since, until, currentEnd time.Time
-	if options.StartTime != nil {
-		since = *options.StartTime
-	}
-	if options.EndTime != nil {
-		until = *options.EndTime
-	} else {
-		until = time.Now()
-	}
 
-	currentEnd = until
-
-	for {
-
-		// the fetch result is from newest to oldest
-		endTime := currentEnd.Add(interval.Duration())
-		options.EndTime = &endTime
-		lines, err := e._queryKLines(ctx, symbol, interval, types.KLineQueryOptions{
-			StartTime: &since,
-			EndTime:   &currentEnd,
-		})
-
-		if err != nil {
-			return nil, err
-		}
-
-		if len(lines) == 0 {
-			break
-		}
-
-		for _, line := range lines {
-
-			if line.StartTime.Unix() < currentEnd.Unix() {
-				currentEnd = line.StartTime.Time()
-			}
-
-			if line.StartTime.Unix() > since.Unix() {
-				klines = append(klines, line)
-			}
-		}
-
-		if len(lines) == 1 && lines[0].StartTime.Unix() == currentEnd.Unix() {
-			break
-		}
-
-		outBound := currentEnd.Add(interval.Duration()*-1).Unix() <= since.Unix()
-		if since.IsZero() || currentEnd.Unix() == since.Unix() || outBound {
-			break
-		}
-
-		if options.Limit != 0 && options.Limit <= len(lines) {
-			break
-		}
-	}
-	sort.Slice(klines, func(i, j int) bool { return klines[i].StartTime.Unix() < klines[j].StartTime.Unix() })
-
-	if options.Limit != 0 {
-		limitedItems := len(klines) - options.Limit
-		if limitedItems > 0 {
-			return klines[limitedItems:], nil
-		}
+	// the fetch result is from newest to oldest
+	// currentEnd = until
+	// endTime := currentEnd.Add(interval.Duration())
+	klines, err := e._queryKLines(ctx, symbol, interval, options)
+	if err != nil {
+		return nil, err
 	}
 
+	klines = types.SortKLinesAscending(klines)
 	return klines, nil
 }
 
 func (e *Exchange) _queryKLines(ctx context.Context, symbol string, interval types.Interval, options types.KLineQueryOptions) ([]types.KLine, error) {
-	var since, until time.Time
-	if options.StartTime != nil {
-		since = *options.StartTime
-	}
-	if options.EndTime != nil {
-		until = *options.EndTime
-	} else {
-		until = time.Now()
-	}
-	if since.After(until) {
-		return nil, fmt.Errorf("invalid query klines time range, since: %+v, until: %+v", since, until)
-	}
 	if !isIntervalSupportedInKLine(interval) {
 		return nil, fmt.Errorf("interval %s is not supported", interval.String())
 	}
 
-	if err := requestLimit.Wait(ctx); err != nil {
+	if err := marketDataLimiter.Wait(ctx); err != nil {
 		return nil, err
 	}
 
-	resp, err := e.newRest().HistoricalPrices(ctx, toLocalSymbol(symbol), interval, 0, since, until)
+	// assign limit to a default value since ftx has the limit
+	if options.Limit == 0 {
+		options.Limit = 500
+	}
+
+	// if the time range exceed the ftx valid time range, we need to adjust the endTime
+	if options.StartTime != nil && options.EndTime != nil {
+		rangeDuration := options.EndTime.Sub(*options.StartTime)
+		estimatedCount := rangeDuration / interval.Duration()
+
+		if options.Limit != 0 && uint64(estimatedCount) > uint64(options.Limit) {
+			endTime := options.StartTime.Add(interval.Duration() * time.Duration(options.Limit))
+			options.EndTime = &endTime
+		}
+	}
+
+	resp, err := e.newRest().marketRequest.HistoricalPrices(ctx, toLocalSymbol(symbol), interval, int64(options.Limit), options.StartTime, options.EndTime)
 	if err != nil {
 		return nil, err
 	}
@@ -333,6 +306,7 @@ func (e *Exchange) _queryKLines(ctx context.Context, symbol string, interval typ
 		}
 		klines = append(klines, globalKline)
 	}
+
 	return klines, nil
 }
 
@@ -427,55 +401,54 @@ func (e *Exchange) QueryDepositHistory(ctx context.Context, asset string, since,
 	return
 }
 
-func (e *Exchange) SubmitOrders(ctx context.Context, orders ...types.SubmitOrder) (types.OrderSlice, error) {
-	var createdOrders types.OrderSlice
+func (e *Exchange) SubmitOrder(ctx context.Context, order types.SubmitOrder) (*types.Order, error) {
 	// TODO: currently only support limit and market order
 	// TODO: support time in force
-	for _, so := range orders {
-		if err := requestLimit.Wait(ctx); err != nil {
-			logrus.WithError(err).Error("rate limit error")
-		}
-
-		orderType, err := toLocalOrderType(so.Type)
-		if err != nil {
-			logrus.WithError(err).Error("type error")
-		}
-
-		req := e.client.NewPlaceOrderRequest()
-		req.Market(toLocalSymbol(TrimUpperString(so.Symbol)))
-		req.OrderType(orderType)
-		req.Side(ftxapi.Side(TrimLowerString(string(so.Side))))
-		req.Size(so.Quantity)
-
-		switch so.Type {
-		case types.OrderTypeLimit, types.OrderTypeLimitMaker:
-			req.Price(so.Price)
-
-		}
-
-		if so.Type == types.OrderTypeLimitMaker {
-			req.PostOnly(true)
-		}
-
-		if so.TimeInForce == types.TimeInForceIOC {
-			req.Ioc(true)
-		}
-
-		req.ClientID(newSpotClientOrderID(so.ClientOrderID))
-
-		or, err := req.Do(ctx)
-		if err != nil {
-			return createdOrders, fmt.Errorf("failed to place order %+v: %w", so, err)
-		}
-
-		globalOrder, err := toGlobalOrderNew(*or)
-		if err != nil {
-			return createdOrders, fmt.Errorf("failed to convert response to global order")
-		}
-
-		createdOrders = append(createdOrders, globalOrder)
+	so := order
+	if err := requestLimit.Wait(ctx); err != nil {
+		logrus.WithError(err).Error("rate limit error")
 	}
-	return createdOrders, nil
+
+	orderType, err := toLocalOrderType(so.Type)
+	if err != nil {
+		logrus.WithError(err).Error("type error")
+	}
+
+	submitQuantity := so.Quantity
+	switch orderType {
+	case ftxapi.OrderTypeLimit, ftxapi.OrderTypeStopLimit:
+		submitQuantity = so.Quantity.Div(e.orderAmountReduceFactor)
+	}
+
+	req := e.client.NewPlaceOrderRequest()
+	req.Market(toLocalSymbol(TrimUpperString(so.Symbol)))
+	req.OrderType(orderType)
+	req.Side(ftxapi.Side(TrimLowerString(string(so.Side))))
+	req.Size(submitQuantity)
+
+	switch so.Type {
+	case types.OrderTypeLimit, types.OrderTypeLimitMaker:
+		req.Price(so.Price)
+
+	}
+
+	if so.Type == types.OrderTypeLimitMaker {
+		req.PostOnly(true)
+	}
+
+	if so.TimeInForce == types.TimeInForceIOC {
+		req.Ioc(true)
+	}
+
+	req.ClientID(newSpotClientOrderID(so.ClientOrderID))
+
+	or, err := req.Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to place order %+v: %w", so, err)
+	}
+
+	globalOrder, err := toGlobalOrderNew(*or)
+	return &globalOrder, err
 }
 
 func (e *Exchange) QueryOrder(ctx context.Context, q types.OrderQuery) (*types.Order, error) {
@@ -490,8 +463,12 @@ func (e *Exchange) QueryOrder(ctx context.Context, q types.OrderQuery) (*types.O
 		return nil, err
 	}
 
-	order, err := toGlobalOrderNew(*ftxOrder)
-	return &order, err
+	o, err := toGlobalOrderNew(*ftxOrder)
+	if err != nil {
+		return nil, err
+	}
+
+	return &o, err
 }
 
 func (e *Exchange) QueryOpenOrders(ctx context.Context, symbol string) (orders []types.Order, err error) {
@@ -592,7 +569,6 @@ func (e *Exchange) QueryTicker(ctx context.Context, symbol string) (*types.Ticke
 }
 
 func (e *Exchange) QueryTickers(ctx context.Context, symbol ...string) (map[string]types.Ticker, error) {
-
 	var tickers = make(map[string]types.Ticker)
 
 	markets, err := e._queryMarkets(ctx)
@@ -606,7 +582,6 @@ func (e *Exchange) QueryTickers(ctx context.Context, symbol ...string) (map[stri
 	}
 
 	rest := e.newRest()
-
 	for k, v := range markets {
 
 		// if we provide symbol as condition then we only query the gieven symbol ,
@@ -620,7 +595,10 @@ func (e *Exchange) QueryTickers(ctx context.Context, symbol ...string) (map[stri
 		}
 
 		// ctx context.Context, market string, interval types.Interval, limit int64, start, end time.Time
-		prices, err := rest.HistoricalPrices(ctx, v.Market.LocalSymbol, types.Interval1h, 1, time.Now().Add(time.Duration(-1)*time.Hour), time.Now())
+		now := time.Now()
+		since := now.Add(time.Duration(-1) * time.Hour)
+		until := now
+		prices, err := rest.marketRequest.HistoricalPrices(ctx, v.Market.LocalSymbol, types.Interval1h, 1, &since, &until)
 		if err != nil || !prices.Success || len(prices.Result) == 0 {
 			continue
 		}

@@ -11,7 +11,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-var limiter = rate.NewLimiter(rate.Every(time.Minute), 45)
+var limiter = rate.NewLimiter(rate.Every(time.Minute), 3)
 
 type LogHook struct {
 	Slack        *slack.Client
@@ -40,7 +40,7 @@ func (t *LogHook) Fire(e *logrus.Entry) error {
 		return nil
 	}
 
-	var color = ""
+	var color string
 
 	switch e.Level {
 	case logrus.DebugLevel:

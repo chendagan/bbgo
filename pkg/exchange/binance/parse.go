@@ -51,7 +51,7 @@ executionReport
   "O": 1499405658657,            // Order creation time
   "Z": "0.00000000",             // Cumulative quote asset transacted quantity
   "Y": "0.00000000",             // Last quote asset transacted quantity (i.e. lastPrice * lastQty)
-  "Q": "0.00000000"              // Quote Order Qty
+  "Q": "0.00000000"              // Quote Order Quantity
 }
 */
 type ExecutionReportEvent struct {
@@ -113,17 +113,16 @@ func (e *ExecutionReportEvent) Order() (*types.Order, error) {
 	orderCreationTime := time.Unix(0, e.OrderCreationTime*int64(time.Millisecond))
 	return &types.Order{
 		SubmitOrder: types.SubmitOrder{
-			ClientOrderID:    e.ClientOrderID,
-			Symbol:           e.Symbol,
-			Side:             toGlobalSideType(binance.SideType(e.Side)),
-			Type:             toGlobalOrderType(binance.OrderType(e.OrderType)),
-			Quantity:         e.OrderQuantity,
-			Price:            e.OrderPrice,
-			StopPrice:        e.StopPrice,
-			TimeInForce:      types.TimeInForce(e.TimeInForce),
-			IsFutures:        false,
-			ReduceOnly:       false,
-			ClosePosition:    false,
+			ClientOrderID: e.ClientOrderID,
+			Symbol:        e.Symbol,
+			Side:          toGlobalSideType(binance.SideType(e.Side)),
+			Type:          toGlobalOrderType(binance.OrderType(e.OrderType)),
+			Quantity:      e.OrderQuantity,
+			Price:         e.OrderPrice,
+			StopPrice:     e.StopPrice,
+			TimeInForce:   types.TimeInForce(e.TimeInForce),
+			ReduceOnly:    false,
+			ClosePosition: false,
 		},
 		Exchange:         types.ExchangeBinance,
 		IsWorking:        e.IsOnBook,
@@ -276,7 +275,7 @@ func parseWebSocketEvent(message []byte) (interface{}, error) {
 	// fmt.Println(str)
 	eventType := string(val.GetStringBytes("e"))
 	if eventType == "" && IsBookTicker(val) {
-		eventType = "bookticker"
+		eventType = "bookTicker"
 	}
 
 	switch eventType {
@@ -284,7 +283,7 @@ func parseWebSocketEvent(message []byte) (interface{}, error) {
 		var event KLineEvent
 		err := json.Unmarshal([]byte(message), &event)
 		return &event, err
-	case "bookticker":
+	case "bookTicker":
 		var event BookTickerEvent
 		err := json.Unmarshal([]byte(message), &event)
 		event.Event = eventType
@@ -292,22 +291,22 @@ func parseWebSocketEvent(message []byte) (interface{}, error) {
 
 	case "outboundAccountPosition":
 		var event OutboundAccountPositionEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	case "outboundAccountInfo":
 		var event OutboundAccountInfoEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	case "balanceUpdate":
 		var event BalanceUpdateEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	case "executionReport":
 		var event ExecutionReportEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	case "depthUpdate":
@@ -315,35 +314,45 @@ func parseWebSocketEvent(message []byte) (interface{}, error) {
 
 	case "markPriceUpdate":
 		var event MarkPriceUpdateEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
+		return &event, err
+
+	case "listenKeyExpired":
+		var event ListenKeyExpired
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	// Binance futures data --------------
 	case "continuousKline":
 		var event ContinuousKLineEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	case "ORDER_TRADE_UPDATE":
 		var event OrderTradeUpdateEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	// Event: Balance and Position Update
 	case "ACCOUNT_UPDATE":
 		var event AccountUpdateEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	// Event: Order Update
 	case "ACCOUNT_CONFIG_UPDATE":
 		var event AccountConfigUpdateEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	case "trade":
 		var event MarketTradeEvent
-		err := json.Unmarshal([]byte(message), &event)
+		err = json.Unmarshal([]byte(message), &event)
+		return &event, err
+
+	case "aggTrade":
+		var event AggTradeEvent
+		err = json.Unmarshal([]byte(message), &event)
 		return &event, err
 
 	default:
@@ -538,6 +547,63 @@ func (e *MarketTradeEvent) Trade() types.Trade {
 	}
 }
 
+type AggTradeEvent struct {
+	EventBase
+	Symbol         string           `json:"s"`
+	Quantity       fixedpoint.Value `json:"q"`
+	Price          fixedpoint.Value `json:"p"`
+	FirstTradeId   int64            `json:"f"`
+	LastTradeId    int64            `json:"l"`
+	OrderTradeTime int64            `json:"T"`
+	IsMaker        bool             `json:"m"`
+	Dummy          bool             `json:"M"`
+}
+
+/*
+aggregate trade
+{
+  "e": "aggTrade",  // Event type
+  "E": 123456789,   // Event time
+  "s": "BNBBTC",    // Symbol
+  "a": 12345,       // Aggregate trade ID
+  "p": "0.001",     // Price
+  "q": "100",       // Quantity
+  "f": 100,         // First trade ID
+  "l": 105,         // Last trade ID
+  "T": 123456785,   // Trade time
+  "m": true,        // Is the buyer the market maker?
+  "M": true         // Ignore
+}
+*/
+
+func (e *AggTradeEvent) Trade() types.Trade {
+	tt := time.Unix(0, e.OrderTradeTime*int64(time.Millisecond))
+	var side types.SideType
+	var isBuyer bool
+	if e.IsMaker {
+		side = types.SideTypeSell
+		isBuyer = false
+	} else {
+		side = types.SideTypeBuy
+		isBuyer = true
+	}
+	return types.Trade{
+		ID:            uint64(e.LastTradeId),
+		Exchange:      types.ExchangeBinance,
+		Symbol:        e.Symbol,
+		OrderID:       0,
+		Side:          side,
+		Price:         e.Price,
+		Quantity:      e.Quantity,
+		QuoteQuantity: e.Quantity,
+		IsBuyer:       isBuyer,
+		IsMaker:       e.IsMaker,
+		Time:          types.Time(tt),
+		Fee:           fixedpoint.Zero,
+		FeeCurrency:   "",
+	}
+}
+
 type KLine struct {
 	StartTime int64 `json:"t"`
 	EndTime   int64 `json:"T"`
@@ -617,6 +683,10 @@ func (k *KLine) KLine() types.KLine {
 		NumberOfTrades:           uint64(k.NumberOfTrades),
 		Closed:                   k.Closed,
 	}
+}
+
+type ListenKeyExpired struct {
+	EventBase
 }
 
 type MarkPriceUpdateEvent struct {
@@ -810,7 +880,7 @@ func (e *OrderTradeUpdateEvent) TradeFutures() (*types.Trade, error) {
 		Side:          toGlobalSideType(binance.SideType(e.OrderTrade.Side)),
 		Price:         e.OrderTrade.LastFilledPrice,
 		Quantity:      e.OrderTrade.OrderLastFilledQuantity,
-		QuoteQuantity: e.OrderTrade.OrderFilledAccumulatedQuantity,
+		QuoteQuantity: e.OrderTrade.LastFilledPrice.Mul(e.OrderTrade.OrderLastFilledQuantity),
 		IsBuyer:       e.OrderTrade.Side == "BUY",
 		IsMaker:       e.OrderTrade.IsMaker,
 		Time:          types.Time(tt),

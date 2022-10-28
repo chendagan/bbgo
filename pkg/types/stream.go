@@ -28,7 +28,9 @@ type Stream interface {
 	StandardStreamEventHub
 
 	Subscribe(channel Channel, symbol string, options SubscribeOptions)
+	GetSubscriptions() []Subscription
 	SetPublicOnly()
+	GetPublicOnly() bool
 	Connect(ctx context.Context) error
 	Close() error
 }
@@ -98,10 +100,32 @@ type StandardStream struct {
 
 	marketTradeCallbacks []func(trade Trade)
 
+	aggTradeCallbacks []func(trade Trade)
+
 	// Futures
 	FuturesPositionUpdateCallbacks []func(futuresPositions FuturesPositionMap)
 
 	FuturesPositionSnapshotCallbacks []func(futuresPositions FuturesPositionMap)
+}
+
+type StandardStreamEmitter interface {
+	Stream
+	EmitStart()
+	EmitConnect()
+	EmitDisconnect()
+	EmitTradeUpdate(Trade)
+	EmitOrderUpdate(Order)
+	EmitBalanceSnapshot(BalanceMap)
+	EmitBalanceUpdate(BalanceMap)
+	EmitKLineClosed(KLine)
+	EmitKLine(KLine)
+	EmitBookUpdate(SliceOrderBook)
+	EmitBookTickerUpdate(BookTicker)
+	EmitBookSnapshot(SliceOrderBook)
+	EmitMarketTrade(Trade)
+	EmitAggTrade(Trade)
+	EmitFuturesPositionUpdate(FuturesPositionMap)
+	EmitFuturesPositionSnapshot(FuturesPositionMap)
 }
 
 func NewStandardStream() StandardStream {
@@ -113,6 +137,10 @@ func NewStandardStream() StandardStream {
 
 func (s *StandardStream) SetPublicOnly() {
 	s.PublicOnly = true
+}
+
+func (s *StandardStream) GetPublicOnly() bool {
+	return s.PublicOnly
 }
 
 func (s *StandardStream) SetEndpointCreator(creator EndpointCreator) {
@@ -229,7 +257,7 @@ func (s *StandardStream) Read(ctx context.Context, conn *websocket.Conn, cancel 
 func (s *StandardStream) ping(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc, interval time.Duration) {
 	defer func() {
 		cancel()
-		log.Debug("ping worker stopped")
+		log.Debug("[websocket] ping worker stopped")
 	}()
 
 	var pingTicker = time.NewTicker(interval)
@@ -245,13 +273,16 @@ func (s *StandardStream) ping(ctx context.Context, conn *websocket.Conn, cancel 
 			return
 
 		case <-pingTicker.C:
-			log.Debugf("websocket -> ping")
 			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout)); err != nil {
 				log.WithError(err).Error("ping error", err)
 				s.Reconnect()
 			}
 		}
 	}
+}
+
+func (s *StandardStream) GetSubscriptions() []Subscription {
+	return s.Subscriptions
 }
 
 func (s *StandardStream) Subscribe(channel Channel, symbol string, options SubscribeOptions) {
@@ -348,19 +379,18 @@ func (s *StandardStream) Dial(ctx context.Context, args ...string) (*websocket.C
 	// Unsolicited pong frames are allowed.
 	conn.SetPingHandler(nil)
 	conn.SetPongHandler(func(string) error {
-		log.Debugf("websocket <- received pong")
 		if err := conn.SetReadDeadline(time.Now().Add(readTimeout * 2)); err != nil {
 			log.WithError(err).Error("pong handler can not set read deadline")
 		}
 		return nil
 	})
 
-	log.Infof("websocket connected, public = %v, read timeout = %v", s.PublicOnly, readTimeout)
+	log.Infof("[websocket] connected, public = %v, read timeout = %v", s.PublicOnly, readTimeout)
 	return conn, nil
 }
 
 func (s *StandardStream) Close() error {
-	log.Debugf("closing stream...")
+	log.Debugf("[websocket] closing stream...")
 
 	// close the close signal channel, so that reader and ping worker will stop
 	close(s.CloseC)
@@ -382,7 +412,7 @@ func (s *StandardStream) Close() error {
 		return errors.Wrap(err, "websocket write close message error")
 	}
 
-	log.Debugf("stream closed")
+	log.Debugf("[websocket] stream closed")
 
 	// let the reader close the connection
 	<-time.After(time.Second)
@@ -410,14 +440,14 @@ const (
 // SubscribeOptions provides the standard stream options
 type SubscribeOptions struct {
 	// TODO: change to Interval type later
-	Interval string `json:"interval,omitempty"`
-	Depth    Depth  `json:"depth,omitempty"`
-	Speed    Speed  `json:"speed,omitempty"`
+	Interval Interval `json:"interval,omitempty"`
+	Depth    Depth    `json:"depth,omitempty"`
+	Speed    Speed    `json:"speed,omitempty"`
 }
 
 func (o SubscribeOptions) String() string {
 	if len(o.Interval) > 0 {
-		return o.Interval
+		return string(o.Interval)
 	}
 
 	return string(o.Depth)

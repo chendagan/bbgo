@@ -16,7 +16,6 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/c9s/bbgo/pkg/bbgo"
-	"github.com/c9s/bbgo/pkg/cmd"
 	"github.com/c9s/bbgo/pkg/server"
 )
 
@@ -93,7 +92,7 @@ func main() {
 
 	// we could initialize the environment from the settings
 	if setup == nil {
-		if err := cmd.BootstrapEnvironment(ctx, environ, userConfig); err != nil {
+		if err := bbgo.BootstrapEnvironment(ctx, environ, userConfig); err != nil {
 			log.WithError(err).Error("failed to bootstrap environment")
 			return
 		}
@@ -110,6 +109,11 @@ func main() {
 				return
 			}
 
+			if err := trader.LoadState(); err != nil {
+				log.WithError(err).Error("failed to load strategy states")
+				return
+			}
+
 			// for setup mode, we don't start the trader
 			if err := trader.Run(ctx); err != nil {
 				log.WithError(err).Error("failed to start trader")
@@ -118,7 +122,7 @@ func main() {
 	}
 
 	// find a free port for binding the server
-	ln, err := net.Listen("tcp", "127.0.0.1:" + strconv.Itoa(portNum))
+	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(portNum))
 	if err != nil {
 		log.WithError(err).Error("can not bind listener")
 		return

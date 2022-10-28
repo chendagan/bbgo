@@ -17,9 +17,9 @@ import (
 	"github.com/c9s/bbgo/pkg/types"
 )
 
-var marketDataLimiter = rate.NewLimiter(rate.Every(1*time.Second), 1)
-var queryTradeLimiter = rate.NewLimiter(rate.Every(5*time.Second), 1)
-var queryOrderLimiter = rate.NewLimiter(rate.Every(5*time.Second), 1)
+var marketDataLimiter = rate.NewLimiter(rate.Every(6*time.Second), 1)
+var queryTradeLimiter = rate.NewLimiter(rate.Every(6*time.Second), 1)
+var queryOrderLimiter = rate.NewLimiter(rate.Every(6*time.Second), 1)
 
 var ErrMissingSequence = errors.New("sequence is missing")
 
@@ -44,7 +44,8 @@ func New(key, secret, passphrase string) *Exchange {
 	}
 
 	return &Exchange{
-		key:        key,
+		key: key,
+		// pragma: allowlist nextline secret
 		secret:     secret,
 		passphrase: passphrase,
 		client:     client,
@@ -138,10 +139,10 @@ func (e *Exchange) QueryTickers(ctx context.Context, symbols ...string) (map[str
 // From the doc
 // Type of candlestick patterns: 1min, 3min, 5min, 15min, 30min, 1hour, 2hour, 4hour, 6hour, 8hour, 12hour, 1day, 1week
 var supportedIntervals = map[types.Interval]int{
-	types.Interval1m:  60,
-	types.Interval5m:  60 * 5,
-	types.Interval15m: 60 * 15,
-	types.Interval30m: 60 * 30,
+	types.Interval1m:  1 * 60,
+	types.Interval5m:  5 * 60,
+	types.Interval15m: 15 * 60,
+	types.Interval30m: 30 * 60,
 	types.Interval1h:  60 * 60,
 	types.Interval2h:  60 * 60 * 2,
 	types.Interval4h:  60 * 60 * 4,
@@ -160,7 +161,9 @@ func (e *Exchange) IsSupportedInterval(interval types.Interval) bool {
 }
 
 func (e *Exchange) QueryKLines(ctx context.Context, symbol string, interval types.Interval, options types.KLineQueryOptions) ([]types.KLine, error) {
-	_ = marketDataLimiter.Wait(ctx)
+	if err := marketDataLimiter.Wait(ctx); err != nil {
+		return nil, err
+	}
 
 	req := e.client.MarketDataService.NewGetKLinesRequest()
 	req.Symbol(toLocalSymbol(symbol))
@@ -204,78 +207,74 @@ func (e *Exchange) QueryKLines(ctx context.Context, symbol string, interval type
 	return klines, nil
 }
 
-func (e *Exchange) SubmitOrders(ctx context.Context, orders ...types.SubmitOrder) (createdOrders types.OrderSlice, err error) {
-	for _, order := range orders {
-		req := e.client.TradeService.NewPlaceOrderRequest()
-		req.Symbol(toLocalSymbol(order.Symbol))
-		req.Side(toLocalSide(order.Side))
+func (e *Exchange) SubmitOrder(ctx context.Context, order types.SubmitOrder) (createdOrder *types.Order, err error) {
+	req := e.client.TradeService.NewPlaceOrderRequest()
+	req.Symbol(toLocalSymbol(order.Symbol))
+	req.Side(toLocalSide(order.Side))
 
-		if order.ClientOrderID != "" {
-			req.ClientOrderID(order.ClientOrderID)
-		}
-
-		if order.Market.Symbol != "" {
-			req.Size(order.Market.FormatQuantity(order.Quantity))
-		} else {
-			// TODO: report error?
-			req.Size(order.Quantity.FormatString(8))
-		}
-
-		// set price field for limit orders
-		switch order.Type {
-		case types.OrderTypeStopLimit, types.OrderTypeLimit, types.OrderTypeLimitMaker:
-			if order.Market.Symbol != "" {
-				req.Price(order.Market.FormatPrice(order.Price))
-			} else {
-				// TODO: report error?
-				req.Price(order.Price.FormatString(8))
-			}
-		}
-
-		if order.Type == types.OrderTypeLimitMaker {
-			req.PostOnly(true)
-		}
-
-		switch order.TimeInForce {
-		case "FOK":
-			req.TimeInForce(kucoinapi.TimeInForceFOK)
-		case "IOC":
-			req.TimeInForce(kucoinapi.TimeInForceIOC)
-		default:
-			// default to GTC
-			req.TimeInForce(kucoinapi.TimeInForceGTC)
-		}
-
-		switch order.Type {
-		case types.OrderTypeStopLimit:
-			req.OrderType(kucoinapi.OrderTypeStopLimit)
-
-		case types.OrderTypeLimit, types.OrderTypeLimitMaker:
-			req.OrderType(kucoinapi.OrderTypeLimit)
-
-		case types.OrderTypeMarket:
-			req.OrderType(kucoinapi.OrderTypeMarket)
-		}
-
-		orderResponse, err := req.Do(ctx)
-		if err != nil {
-			return createdOrders, err
-		}
-
-		createdOrders = append(createdOrders, types.Order{
-			SubmitOrder:      order,
-			Exchange:         types.ExchangeKucoin,
-			OrderID:          hashStringID(orderResponse.OrderID),
-			UUID:             orderResponse.OrderID,
-			Status:           types.OrderStatusNew,
-			ExecutedQuantity: fixedpoint.Zero,
-			IsWorking:        true,
-			CreationTime:     types.Time(time.Now()),
-			UpdateTime:       types.Time(time.Now()),
-		})
+	if order.ClientOrderID != "" {
+		req.ClientOrderID(order.ClientOrderID)
 	}
 
-	return createdOrders, err
+	if order.Market.Symbol != "" {
+		req.Size(order.Market.FormatQuantity(order.Quantity))
+	} else {
+		// TODO: report error?
+		req.Size(order.Quantity.FormatString(8))
+	}
+
+	// set price field for limit orders
+	switch order.Type {
+	case types.OrderTypeStopLimit, types.OrderTypeLimit, types.OrderTypeLimitMaker:
+		if order.Market.Symbol != "" {
+			req.Price(order.Market.FormatPrice(order.Price))
+		} else {
+			// TODO: report error?
+			req.Price(order.Price.FormatString(8))
+		}
+	}
+
+	if order.Type == types.OrderTypeLimitMaker {
+		req.PostOnly(true)
+	}
+
+	switch order.TimeInForce {
+	case "FOK":
+		req.TimeInForce(kucoinapi.TimeInForceFOK)
+	case "IOC":
+		req.TimeInForce(kucoinapi.TimeInForceIOC)
+	default:
+		// default to GTC
+		req.TimeInForce(kucoinapi.TimeInForceGTC)
+	}
+
+	switch order.Type {
+	case types.OrderTypeStopLimit:
+		req.OrderType(kucoinapi.OrderTypeStopLimit)
+
+	case types.OrderTypeLimit, types.OrderTypeLimitMaker:
+		req.OrderType(kucoinapi.OrderTypeLimit)
+
+	case types.OrderTypeMarket:
+		req.OrderType(kucoinapi.OrderTypeMarket)
+	}
+
+	orderResponse, err := req.Do(ctx)
+	if err != nil {
+		return createdOrder, err
+	}
+
+	return &types.Order{
+		SubmitOrder:      order,
+		Exchange:         types.ExchangeKucoin,
+		OrderID:          hashStringID(orderResponse.OrderID),
+		UUID:             orderResponse.OrderID,
+		Status:           types.OrderStatusNew,
+		ExecutedQuantity: fixedpoint.Zero,
+		IsWorking:        true,
+		CreationTime:     types.Time(time.Now()),
+		UpdateTime:       types.Time(time.Now()),
+	}, nil
 }
 
 // QueryOpenOrders

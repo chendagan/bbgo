@@ -48,6 +48,7 @@ type Stream struct {
 
 	markPriceUpdateEventCallbacks []func(e *MarkPriceUpdateEvent)
 	marketTradeEventCallbacks     []func(e *MarketTradeEvent)
+	aggTradeEventCallbacks        []func(e *AggTradeEvent)
 
 	continuousKLineEventCallbacks       []func(e *ContinuousKLineEvent)
 	continuousKLineClosedEventCallbacks []func(e *ContinuousKLineEvent)
@@ -61,6 +62,8 @@ type Stream struct {
 	orderTradeUpdateEventCallbacks    []func(e *OrderTradeUpdateEvent)
 	accountUpdateEventCallbacks       []func(e *AccountUpdateEvent)
 	accountConfigUpdateEventCallbacks []func(e *AccountConfigUpdateEvent)
+
+	listenKeyExpiredCallbacks []func(e *ListenKeyExpired)
 
 	depthBuffers map[string]*depth.Buffer
 }
@@ -118,6 +121,7 @@ func NewStream(ex *Exchange, client *binance.Client, futuresClient *futures.Clie
 	stream.OnExecutionReportEvent(stream.handleExecutionReportEvent)
 	stream.OnContinuousKLineEvent(stream.handleContinuousKLineEvent)
 	stream.OnMarketTradeEvent(stream.handleMarketTradeEvent)
+	stream.OnAggTradeEvent(stream.handleAggTradeEvent)
 
 	// Event type ACCOUNT_UPDATE from user data stream updates Balance and FuturesPosition.
 	stream.OnAccountUpdateEvent(stream.handleAccountUpdateEvent)
@@ -125,6 +129,9 @@ func NewStream(ex *Exchange, client *binance.Client, futuresClient *futures.Clie
 	stream.OnOrderTradeUpdateEvent(stream.handleOrderTradeUpdateEvent)
 	stream.OnDisconnect(stream.handleDisconnect)
 	stream.OnConnect(stream.handleConnect)
+	stream.OnListenKeyExpired(func(e *ListenKeyExpired) {
+		stream.Reconnect()
+	})
 	return stream
 }
 
@@ -213,6 +220,10 @@ func (s *Stream) handleMarketTradeEvent(e *MarketTradeEvent) {
 	s.EmitMarketTrade(e.Trade())
 }
 
+func (s *Stream) handleAggTradeEvent(e *AggTradeEvent) {
+	s.EmitAggTrade(e.Trade())
+}
+
 func (s *Stream) handleKLineEvent(e *KLineEvent) {
 	kline := e.KLine.KLine()
 	if e.KLine.Closed {
@@ -267,6 +278,17 @@ func (s *Stream) handleOrderTradeUpdateEvent(e *OrderTradeUpdateEvent) {
 		}
 
 		s.EmitTradeUpdate(*trade)
+
+		order, err := e.OrderFutures()
+		if err != nil {
+			log.WithError(err).Error("futures order convert error")
+			return
+		}
+
+		// Update Order with FILLED event
+		if order.Status == types.OrderStatusFilled {
+			s.EmitOrderUpdate(*order)
+		}
 
 	case "CALCULATED - Liquidation Execution":
 		log.Infof("CALCULATED - Liquidation Execution not support yet.")
@@ -326,6 +348,9 @@ func (s *Stream) dispatchEvent(e interface{}) {
 	case *MarketTradeEvent:
 		s.EmitMarketTradeEvent(e)
 
+	case *AggTradeEvent:
+		s.EmitAggTradeEvent(e)
+
 	case *KLineEvent:
 		s.EmitKLineEvent(e)
 
@@ -352,6 +377,10 @@ func (s *Stream) dispatchEvent(e interface{}) {
 
 	case *AccountConfigUpdateEvent:
 		s.EmitAccountConfigUpdateEvent(e)
+
+	case *ListenKeyExpired:
+		s.EmitListenKeyExpired(e)
+
 	}
 }
 

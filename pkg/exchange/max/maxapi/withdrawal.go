@@ -56,12 +56,12 @@ type WithdrawalAddress struct {
 
 //go:generate GetRequest -url "v2/withdraw_addresses" -type GetWithdrawalAddressesRequest -responseType []WithdrawalAddress
 type GetWithdrawalAddressesRequest struct {
-	client      requestgen.AuthenticatedAPIClient
-	currency    string  `param:"currency,required"`
+	client   requestgen.AuthenticatedAPIClient
+	currency string `param:"currency,required"`
 }
 
 type WithdrawalService struct {
-	client *RestClient
+	client requestgen.AuthenticatedAPIClient
 }
 
 func (s *WithdrawalService) NewGetWithdrawalAddressesRequest() *GetWithdrawalAddressesRequest {

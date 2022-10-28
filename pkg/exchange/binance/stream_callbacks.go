@@ -54,6 +54,16 @@ func (s *Stream) EmitMarketTradeEvent(e *MarketTradeEvent) {
 	}
 }
 
+func (s *Stream) OnAggTradeEvent(cb func(e *AggTradeEvent)) {
+	s.aggTradeEventCallbacks = append(s.aggTradeEventCallbacks, cb)
+}
+
+func (s *Stream) EmitAggTradeEvent(e *AggTradeEvent) {
+	for _, cb := range s.aggTradeEventCallbacks {
+		cb(e)
+	}
+}
+
 func (s *Stream) OnContinuousKLineEvent(cb func(e *ContinuousKLineEvent)) {
 	s.continuousKLineEventCallbacks = append(s.continuousKLineEventCallbacks, cb)
 }
@@ -154,6 +164,16 @@ func (s *Stream) EmitAccountConfigUpdateEvent(e *AccountConfigUpdateEvent) {
 	}
 }
 
+func (s *Stream) OnListenKeyExpired(cb func(e *ListenKeyExpired)) {
+	s.listenKeyExpiredCallbacks = append(s.listenKeyExpiredCallbacks, cb)
+}
+
+func (s *Stream) EmitListenKeyExpired(e *ListenKeyExpired) {
+	for _, cb := range s.listenKeyExpiredCallbacks {
+		cb(e)
+	}
+}
+
 type StreamEventHub interface {
 	OnDepthEvent(cb func(e *DepthEvent))
 
@@ -164,6 +184,8 @@ type StreamEventHub interface {
 	OnMarkPriceUpdateEvent(cb func(e *MarkPriceUpdateEvent))
 
 	OnMarketTradeEvent(cb func(e *MarketTradeEvent))
+
+	OnAggTradeEvent(cb func(e *AggTradeEvent))
 
 	OnContinuousKLineEvent(cb func(e *ContinuousKLineEvent))
 
@@ -184,4 +206,6 @@ type StreamEventHub interface {
 	OnAccountUpdateEvent(cb func(e *AccountUpdateEvent))
 
 	OnAccountConfigUpdateEvent(cb func(e *AccountConfigUpdateEvent))
+
+	OnListenKeyExpired(cb func(e *ListenKeyExpired))
 }

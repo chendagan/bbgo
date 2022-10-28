@@ -2,11 +2,13 @@ package schedule
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/c9s/bbgo/pkg/bbgo"
+	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -18,8 +20,6 @@ func init() {
 
 type Strategy struct {
 	Market types.Market
-
-	Notifiability *bbgo.Notifiability
 
 	// StandardIndicatorSet contains the standard indicators of a market (symbol)
 	// This field will be injected automatically since we defined the Symbol field.
@@ -36,22 +36,33 @@ type Strategy struct {
 
 	bbgo.QuantityOrAmount
 
+	MaxBaseBalance fixedpoint.Value `json:"maxBaseBalance"`
+
 	BelowMovingAverage *bbgo.MovingAverageSettings `json:"belowMovingAverage,omitempty"`
 
 	AboveMovingAverage *bbgo.MovingAverageSettings `json:"aboveMovingAverage,omitempty"`
+
+	Position *types.Position `persistence:"position"`
+
+	session       *bbgo.ExchangeSession
+	orderExecutor *bbgo.GeneralOrderExecutor
 }
 
 func (s *Strategy) ID() string {
 	return ID
 }
 
+func (s *Strategy) InstanceID() string {
+	return fmt.Sprintf("%s:%s", ID, s.Symbol)
+}
+
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
-	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.Interval.String()})
+	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.Interval})
 	if s.BelowMovingAverage != nil {
-		session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.BelowMovingAverage.Interval.String()})
+		session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.BelowMovingAverage.Interval})
 	}
 	if s.AboveMovingAverage != nil {
-		session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.AboveMovingAverage.Interval.String()})
+		session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: s.AboveMovingAverage.Interval})
 	}
 }
 
@@ -64,9 +75,22 @@ func (s *Strategy) Validate() error {
 }
 
 func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
+	s.session = session
+
 	if s.StandardIndicatorSet == nil {
 		return errors.New("StandardIndicatorSet can not be nil, injection failed?")
 	}
+
+	if s.Position == nil {
+		s.Position = types.NewPositionFromMarket(s.Market)
+	}
+
+	instanceID := s.InstanceID()
+	s.orderExecutor = bbgo.NewGeneralOrderExecutor(session, s.Symbol, ID, instanceID, s.Position)
+	s.orderExecutor.TradeCollector().OnPositionUpdate(func(position *types.Position) {
+		bbgo.Sync(ctx, s)
+	})
+	s.orderExecutor.Bind()
 
 	var belowMA types.Float64Indicator
 	var aboveMA types.Float64Indicator
@@ -129,7 +153,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			}
 
 			if !match {
-				s.Notifiability.Notify("skip, the %s closed price %v is below or above moving average", s.Symbol, closePrice)
+				bbgo.Notify("skip, the %s closed price %v is below or above moving average", s.Symbol, closePrice)
 				return
 			}
 		}
@@ -140,6 +164,16 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		// execute orders
 		switch side {
 		case types.SideTypeBuy:
+			if !s.MaxBaseBalance.IsZero() {
+				if baseBalance, ok := session.GetAccount().Balance(s.Market.BaseCurrency); ok {
+					total := baseBalance.Total()
+					if total.Add(quantity).Compare(s.MaxBaseBalance) >= 0 {
+						quantity = s.MaxBaseBalance.Sub(total)
+						quoteQuantity = quantity.Mul(closePrice)
+					}
+				}
+			}
+
 			quoteBalance, ok := session.GetAccount().Balance(s.Market.QuoteCurrency)
 			if !ok {
 				log.Errorf("can not place scheduled %s order, quote balance %s is empty", s.Symbol, s.Market.QuoteCurrency)
@@ -147,7 +181,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			}
 
 			if quoteBalance.Available.Compare(quoteQuantity) < 0 {
-				s.Notifiability.Notify("Can not place scheduled %s order: quote balance %s is not enough: %v < %v", s.Symbol, s.Market.QuoteCurrency, quoteBalance.Available, quoteQuantity)
+				bbgo.Notify("Can not place scheduled %s order: quote balance %s is not enough: %v < %v", s.Symbol, s.Market.QuoteCurrency, quoteBalance.Available, quoteQuantity)
 				log.Errorf("can not place scheduled %s order: quote balance %s is not enough: %v < %v", s.Symbol, s.Market.QuoteCurrency, quoteBalance.Available, quoteQuantity)
 				return
 			}
@@ -159,16 +193,17 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 				return
 			}
 
-			if baseBalance.Available.Compare(quantity) < 0 {
-				s.Notifiability.Notify("Can not place scheduled %s order: base balance %s is not enough: %v < %v", s.Symbol, s.Market.QuoteCurrency, baseBalance.Available, quantity)
-				log.Errorf("can not place scheduled %s order: base balance %s is not enough: %v < %v", s.Symbol, s.Market.QuoteCurrency, baseBalance.Available, quantity)
-				return
-			}
-
+			quantity = fixedpoint.Min(quantity, baseBalance.Available)
+			quoteQuantity = quantity.Mul(closePrice)
 		}
 
-		s.Notifiability.Notify("Submitting scheduled %s order with quantity %v at price %v", s.Symbol, quantity, closePrice)
-		_, err := orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
+		if s.Market.IsDustQuantity(quantity, closePrice) {
+			log.Warnf("%s: quantity %f is too small", s.Symbol, quantity.Float64())
+			return
+		}
+
+		bbgo.Notify("Submitting scheduled %s order with quantity %s at price %s", s.Symbol, quantity.String(), closePrice.String())
+		_, err := s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
 			Symbol:   s.Symbol,
 			Side:     side,
 			Type:     types.OrderTypeMarket,
@@ -176,7 +211,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			Market:   s.Market,
 		})
 		if err != nil {
-			s.Notifiability.Notify("Can not place scheduled %s order: submit error %s", s.Symbol, err.Error())
+			bbgo.Notify("Can not place scheduled %s order: submit error %s", s.Symbol, err.Error())
 			log.WithError(err).Errorf("can not place scheduled %s order error", s.Symbol)
 		}
 	})

@@ -10,19 +10,21 @@ const defaultVolumeFactor = 0.7
 // Refer URL: https://tradingpedia.com/forex-trading-indicator/t3-moving-average-indicator/
 //go:generate callbackgen -type TILL
 type TILL struct {
+	types.SeriesBase
 	types.IntervalWindow
-	VolumeFactor    float64
-	e1              *EWMA
-	e2              *EWMA
-	e3              *EWMA
-	e4              *EWMA
-	e5              *EWMA
-	e6              *EWMA
-	c1              float64
-	c2              float64
-	c3              float64
-	c4              float64
-	UpdateCallbacks []func(value float64)
+	VolumeFactor float64
+	e1           *EWMA
+	e2           *EWMA
+	e3           *EWMA
+	e4           *EWMA
+	e5           *EWMA
+	e6           *EWMA
+	c1           float64
+	c2           float64
+	c3           float64
+	c4           float64
+
+	updateCallbacks []func(value float64)
 }
 
 func (inc *TILL) Update(value float64) {
@@ -30,12 +32,13 @@ func (inc *TILL) Update(value float64) {
 		if inc.VolumeFactor == 0 {
 			inc.VolumeFactor = defaultVolumeFactor
 		}
-		inc.e1 = &EWMA{IntervalWindow: types.IntervalWindow{inc.Interval, inc.Window}}
-		inc.e2 = &EWMA{IntervalWindow: types.IntervalWindow{inc.Interval, inc.Window}}
-		inc.e3 = &EWMA{IntervalWindow: types.IntervalWindow{inc.Interval, inc.Window}}
-		inc.e4 = &EWMA{IntervalWindow: types.IntervalWindow{inc.Interval, inc.Window}}
-		inc.e5 = &EWMA{IntervalWindow: types.IntervalWindow{inc.Interval, inc.Window}}
-		inc.e6 = &EWMA{IntervalWindow: types.IntervalWindow{inc.Interval, inc.Window}}
+		inc.SeriesBase.Series = inc
+		inc.e1 = &EWMA{IntervalWindow: inc.IntervalWindow}
+		inc.e2 = &EWMA{IntervalWindow: inc.IntervalWindow}
+		inc.e3 = &EWMA{IntervalWindow: inc.IntervalWindow}
+		inc.e4 = &EWMA{IntervalWindow: inc.IntervalWindow}
+		inc.e5 = &EWMA{IntervalWindow: inc.IntervalWindow}
+		inc.e6 = &EWMA{IntervalWindow: inc.IntervalWindow}
 		square := inc.VolumeFactor * inc.VolumeFactor
 		cube := inc.VolumeFactor * square
 		inc.c1 = -cube
@@ -83,20 +86,36 @@ func (inc *TILL) Length() int {
 
 var _ types.Series = &TILL{}
 
-func (inc *TILL) calculateAndUpdate(allKLines []types.KLine) {
-	doable := false
-	if inc.e1 == nil {
-		doable = true
+func (inc *TILL) PushK(k types.KLine) {
+	if inc.e1 != nil && inc.e1.EndTime != zeroTime && k.EndTime.Before(inc.e1.EndTime) {
+		return
 	}
+
+	inc.Update(k.Close.Float64())
+	inc.EmitUpdate(inc.Last())
+}
+
+func (inc *TILL) LoadK(allKLines []types.KLine) {
 	for _, k := range allKLines {
-		if !doable && k.StartTime.After(inc.e1.LastOpenTime) {
-			doable = true
-		}
-		if doable {
-			inc.Update(k.Close.Float64())
-			inc.EmitUpdate(inc.Last())
-		}
+		inc.PushK(k)
 	}
+}
+
+func (inc *TILL) BindK(target KLineClosedEmitter, symbol string, interval types.Interval) {
+	target.OnKLineClosed(types.KLineWith(symbol, interval, inc.PushK))
+}
+
+func (inc *TILL) CalculateAndUpdate(allKLines []types.KLine) {
+	if inc.e1 == nil {
+		for _, k := range allKLines {
+			inc.PushK(k)
+		}
+	} else {
+		end := len(allKLines)
+		last := allKLines[end-1]
+		inc.PushK(last)
+	}
+
 }
 
 func (inc *TILL) handleKLineWindowUpdate(interval types.Interval, window types.KLineWindow) {
@@ -104,7 +123,7 @@ func (inc *TILL) handleKLineWindowUpdate(interval types.Interval, window types.K
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *TILL) Bind(updater KLineWindowUpdater) {

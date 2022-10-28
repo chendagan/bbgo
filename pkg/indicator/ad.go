@@ -3,6 +3,7 @@ package indicator
 import (
 	"time"
 
+	"github.com/c9s/bbgo/pkg/datatype/floats"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -14,8 +15,9 @@ Accumulation/Distribution Indicator (A/D)
 */
 //go:generate callbackgen -type AD
 type AD struct {
+	types.SeriesBase
 	types.IntervalWindow
-	Values   types.Float64Slice
+	Values   floats.Slice
 	PrePrice float64
 
 	EndTime         time.Time
@@ -23,6 +25,9 @@ type AD struct {
 }
 
 func (inc *AD) Update(high, low, cloze, volume float64) {
+	if len(inc.Values) == 0 {
+		inc.SeriesBase.Series = inc
+	}
 	var moneyFlowVolume float64
 	if high == low {
 		moneyFlowVolume = 0
@@ -53,9 +58,9 @@ func (inc *AD) Length() int {
 	return len(inc.Values)
 }
 
-var _ types.Series = &AD{}
+var _ types.SeriesExtend = &AD{}
 
-func (inc *AD) calculateAndUpdate(kLines []types.KLine) {
+func (inc *AD) CalculateAndUpdate(kLines []types.KLine) {
 	for _, k := range kLines {
 		if inc.EndTime != zeroTime && !k.EndTime.After(inc.EndTime) {
 			continue
@@ -66,12 +71,13 @@ func (inc *AD) calculateAndUpdate(kLines []types.KLine) {
 	inc.EmitUpdate(inc.Last())
 	inc.EndTime = kLines[len(kLines)-1].EndTime.Time()
 }
+
 func (inc *AD) handleKLineWindowUpdate(interval types.Interval, window types.KLineWindow) {
 	if inc.Interval != interval {
 		return
 	}
 
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 func (inc *AD) Bind(updater KLineWindowUpdater) {

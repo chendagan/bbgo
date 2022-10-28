@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/codingconcepts/env"
 	"github.com/pkg/errors"
 	"github.com/pquerna/otp"
 	log "github.com/sirupsen/logrus"
@@ -21,7 +20,7 @@ import (
 	"github.com/spf13/viper"
 	"gopkg.in/tucnak/telebot.v2"
 
-	"github.com/c9s/bbgo/pkg/cmd/cmdutil"
+	"github.com/c9s/bbgo/pkg/exchange"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/interact"
 	"github.com/c9s/bbgo/pkg/notifier/slacknotifier"
@@ -35,6 +34,16 @@ import (
 func init() {
 	// randomize pulling
 	rand.Seed(time.Now().UnixNano())
+}
+
+// IsBackTesting is a global variable that indicates the current environment is back-test or not.
+var IsBackTesting = false
+
+var BackTestService *service.BacktestService
+
+func SetBackTesting(s *service.BacktestService) {
+	BackTestService = s
+	IsBackTesting = true
 }
 
 var LoadedExchangeStrategies = make(map[string]SingleExchangeStrategy)
@@ -69,20 +78,18 @@ const (
 
 // Environment presents the real exchange data layer
 type Environment struct {
-	// Notifiability here for environment is for the streaming data notification
-	// note that, for back tests, we don't need notification.
-	Notifiability
-
-	PersistenceServiceFacade *service.PersistenceServiceFacade
-	DatabaseService          *service.DatabaseService
-	OrderService             *service.OrderService
-	TradeService             *service.TradeService
-	ProfitService            *service.ProfitService
-	PositionService          *service.PositionService
-	BacktestService          *service.BacktestService
-	RewardService            *service.RewardService
-	SyncService              *service.SyncService
-	AccountService           *service.AccountService
+	DatabaseService *service.DatabaseService
+	OrderService    *service.OrderService
+	TradeService    *service.TradeService
+	ProfitService   *service.ProfitService
+	PositionService *service.PositionService
+	BacktestService *service.BacktestService
+	RewardService   *service.RewardService
+	MarginService   *service.MarginService
+	SyncService     *service.SyncService
+	AccountService  *service.AccountService
+	WithdrawService *service.WithdrawService
+	DepositService  *service.DepositService
 
 	// startTime is the time of start point (which is used in the backtest)
 	startTime time.Time
@@ -99,16 +106,15 @@ type Environment struct {
 }
 
 func NewEnvironment() *Environment {
+
+	now := time.Now()
 	return &Environment{
 		// default trade scan time
-		syncStartTime: time.Now().AddDate(-1, 0, 0), // defaults to sync from 1 year ago
+		syncStartTime: now.AddDate(-1, 0, 0), // defaults to sync from 1 year ago
 		sessions:      make(map[string]*ExchangeSession),
-		startTime:     time.Now(),
+		startTime:     now,
 
 		syncStatus: SyncNotStarted,
-		PersistenceServiceFacade: &service.PersistenceServiceFacade{
-			Memory: service.NewMemoryService(),
-		},
 	}
 }
 
@@ -176,11 +182,14 @@ func (environ *Environment) ConfigureDatabaseDriver(ctx context.Context, driver 
 	environ.AccountService = &service.AccountService{DB: db}
 	environ.ProfitService = &service.ProfitService{DB: db}
 	environ.PositionService = &service.PositionService{DB: db}
-
+	environ.MarginService = &service.MarginService{DB: db}
+	environ.WithdrawService = &service.WithdrawService{DB: db}
+	environ.DepositService = &service.DepositService{DB: db}
 	environ.SyncService = &service.SyncService{
 		TradeService:    environ.TradeService,
 		OrderService:    environ.OrderService,
 		RewardService:   environ.RewardService,
+		MarginService:   environ.MarginService,
 		WithdrawService: &service.WithdrawService{DB: db},
 		DepositService:  &service.DepositService{DB: db},
 	}
@@ -190,9 +199,6 @@ func (environ *Environment) ConfigureDatabaseDriver(ctx context.Context, driver 
 
 // AddExchangeSession adds the existing exchange session or pre-created exchange session
 func (environ *Environment) AddExchangeSession(name string, session *ExchangeSession) *ExchangeSession {
-	// update Notifiability from the environment
-	session.Notifiability = environ.Notifiability
-
 	environ.sessions[name] = session
 	return session
 }
@@ -215,12 +221,12 @@ func (environ *Environment) ConfigureExchangeSessions(userConfig *Config) error 
 func (environ *Environment) AddExchangesByViperKeys() error {
 	for _, n := range types.SupportedExchanges {
 		if viper.IsSet(string(n) + "-api-key") {
-			exchange, err := cmdutil.NewExchangeWithEnvVarPrefix(n, "")
+			ex, err := exchange.NewWithEnvVarPrefix(n, "")
 			if err != nil {
 				return err
 			}
 
-			environ.AddExchange(n.String(), exchange)
+			environ.AddExchange(n.String(), ex)
 		}
 	}
 
@@ -237,6 +243,10 @@ func (environ *Environment) AddExchangesFromSessionConfig(sessions map[string]*E
 	}
 
 	return nil
+}
+
+func (environ *Environment) IsBackTesting() bool {
+	return environ.BacktestService != nil
 }
 
 // Init prepares the data that will be used by the strategies
@@ -265,180 +275,13 @@ func (environ *Environment) Start(ctx context.Context) (err error) {
 	return
 }
 
-func (environ *Environment) ConfigurePersistence(conf *PersistenceConfig) error {
-	if conf.Redis != nil {
-		if err := env.Set(conf.Redis); err != nil {
-			return err
-		}
-
-		environ.PersistenceServiceFacade.Redis = service.NewRedisPersistenceService(conf.Redis)
-	}
-
-	if conf.Json != nil {
-		if _, err := os.Stat(conf.Json.Directory); os.IsNotExist(err) {
-			if err2 := os.MkdirAll(conf.Json.Directory, 0777); err2 != nil {
-				log.WithError(err2).Errorf("can not create directory: %s", conf.Json.Directory)
-				return err2
-			}
-		}
-
-		environ.PersistenceServiceFacade.Json = &service.JsonPersistenceService{Directory: conf.Json.Directory}
-	}
-
-	return nil
-}
-
-// ConfigureNotificationRouting configures the notification rules
-// for symbol-based routes, we should register the same symbol rules for each session.
-// for session-based routes, we should set the fixed callbacks for each session
-func (environ *Environment) ConfigureNotificationRouting(conf *NotificationConfig) error {
-	// configure routing here
-	if conf.SymbolChannels != nil {
-		environ.SymbolChannelRouter.AddRoute(conf.SymbolChannels)
-	}
-	if conf.SessionChannels != nil {
-		environ.SessionChannelRouter.AddRoute(conf.SessionChannels)
-	}
-
-	if conf.Routing != nil {
-		// configure passive object notification routing
-		switch conf.Routing.Trade {
-		case "$silent": // silent, do not setup notification
-
-		case "$session":
-			defaultTradeUpdateHandler := func(trade types.Trade) {
-				environ.Notify(&trade)
-			}
-			for name := range environ.sessions {
-				session := environ.sessions[name]
-
-				// if we can route session name to channel successfully...
-				channel, ok := environ.SessionChannelRouter.Route(name)
-				if ok {
-					session.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
-						environ.NotifyTo(channel, &trade)
-					})
-				} else {
-					session.UserDataStream.OnTradeUpdate(defaultTradeUpdateHandler)
-				}
-			}
-
-		case "$symbol":
-			// configure object routes for Trade
-			environ.ObjectChannelRouter.Route(func(obj interface{}) (channel string, ok bool) {
-				trade, matched := obj.(*types.Trade)
-				if !matched {
-					return
-				}
-				channel, ok = environ.SymbolChannelRouter.Route(trade.Symbol)
-				return
-			})
-
-			// use same handler for each session
-			handler := func(trade types.Trade) {
-				channel, ok := environ.RouteObject(&trade)
-				if ok {
-					environ.NotifyTo(channel, &trade)
-				} else {
-					environ.Notify(&trade)
-				}
-			}
-			for _, session := range environ.sessions {
-				session.UserDataStream.OnTradeUpdate(handler)
-			}
-		}
-
-		switch conf.Routing.Order {
-
-		case "$silent": // silent, do not setup notification
-
-		case "$session":
-			defaultOrderUpdateHandler := func(order types.Order) {
-				text := util.Render(TemplateOrderReport, order)
-				environ.Notify(text, &order)
-			}
-			for name := range environ.sessions {
-				session := environ.sessions[name]
-
-				// if we can route session name to channel successfully...
-				channel, ok := environ.SessionChannelRouter.Route(name)
-				if ok {
-					session.UserDataStream.OnOrderUpdate(func(order types.Order) {
-						text := util.Render(TemplateOrderReport, order)
-						environ.NotifyTo(channel, text, &order)
-					})
-				} else {
-					session.UserDataStream.OnOrderUpdate(defaultOrderUpdateHandler)
-				}
-			}
-
-		case "$symbol":
-			// add object route
-			environ.ObjectChannelRouter.Route(func(obj interface{}) (channel string, ok bool) {
-				order, matched := obj.(*types.Order)
-				if !matched {
-					return
-				}
-				channel, ok = environ.SymbolChannelRouter.Route(order.Symbol)
-				return
-			})
-
-			// use same handler for each session
-			handler := func(order types.Order) {
-				text := util.Render(TemplateOrderReport, order)
-				channel, ok := environ.RouteObject(&order)
-				if ok {
-					environ.NotifyTo(channel, text, &order)
-				} else {
-					environ.Notify(text, &order)
-				}
-			}
-			for _, session := range environ.sessions {
-				session.UserDataStream.OnOrderUpdate(handler)
-			}
-		}
-
-		switch conf.Routing.SubmitOrder {
-
-		case "$silent": // silent, do not setup notification
-
-		case "$symbol":
-			// add object route
-			environ.ObjectChannelRouter.Route(func(obj interface{}) (channel string, ok bool) {
-				order, matched := obj.(*types.SubmitOrder)
-				if !matched {
-					return
-				}
-
-				channel, ok = environ.SymbolChannelRouter.Route(order.Symbol)
-				return
-			})
-
-		}
-
-		// currently, not used
-		// FIXME: this is causing cyclic import
-		/*
-			switch conf.Routing.PnL {
-			case "$symbol":
-				environ.ObjectChannelRouter.Route(func(obj interface{}) (channel string, ok bool) {
-					report, matched := obj.(*pnl.AverageCostPnlReport)
-					if !matched {
-						return
-					}
-					channel, ok = environ.SymbolChannelRouter.Route(report.Symbol)
-					return
-				})
-			}
-		*/
-
-	}
-	return nil
-}
-
 func (environ *Environment) SetStartTime(t time.Time) *Environment {
 	environ.startTime = t
 	return environ
+}
+
+func (environ *Environment) StartTime() time.Time {
+	return environ.startTime
 }
 
 // SetSyncStartTime overrides the default trade scan time (-7 days)
@@ -569,9 +412,67 @@ func (environ *Environment) setSyncing(status SyncStatus) {
 	environ.syncStatusMutex.Unlock()
 }
 
+func (environ *Environment) syncWithUserConfig(ctx context.Context, userConfig *Config) error {
+	sessions := environ.sessions
+	selectedSessions := userConfig.Sync.Sessions
+	if len(selectedSessions) > 0 {
+		sessions = environ.SelectSessions(selectedSessions...)
+	}
+
+	since := time.Now().AddDate(0, -6, 0)
+	if userConfig.Sync.Since != nil {
+		since = userConfig.Sync.Since.Time()
+	}
+
+	syncSymbolMap, restSymbols := categorizeSyncSymbol(userConfig.Sync.Symbols)
+	for _, session := range sessions {
+		syncSymbols := restSymbols
+		if ss, ok := syncSymbolMap[session.Name]; ok {
+			syncSymbols = append(syncSymbols, ss...)
+		}
+
+		if err := environ.syncSession(ctx, session, syncSymbols...); err != nil {
+			return err
+		}
+
+		if userConfig.Sync.DepositHistory {
+			if err := environ.SyncService.SyncDepositHistory(ctx, session.Exchange, since); err != nil {
+				return err
+			}
+		}
+
+		if userConfig.Sync.WithdrawHistory {
+			if err := environ.SyncService.SyncWithdrawHistory(ctx, session.Exchange, since); err != nil {
+				return err
+			}
+		}
+
+		if userConfig.Sync.RewardHistory {
+			if err := environ.SyncService.SyncRewardHistory(ctx, session.Exchange, since); err != nil {
+				return err
+			}
+		}
+
+		if userConfig.Sync.MarginHistory {
+			if err := environ.SyncService.SyncMarginHistory(ctx, session.Exchange,
+				since,
+				userConfig.Sync.MarginAssets...); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 // Sync syncs all registered exchange sessions
 func (environ *Environment) Sync(ctx context.Context, userConfig ...*Config) error {
 	if environ.SyncService == nil {
+		return nil
+	}
+
+	// for paper trade mode, skip sync
+	if util.IsPaperTrade() {
 		return nil
 	}
 
@@ -583,38 +484,7 @@ func (environ *Environment) Sync(ctx context.Context, userConfig ...*Config) err
 
 	// sync by the defined user config
 	if len(userConfig) > 0 && userConfig[0] != nil && userConfig[0].Sync != nil {
-		syncSymbols := userConfig[0].Sync.Symbols
-		sessions := environ.sessions
-		selectedSessions := userConfig[0].Sync.Sessions
-		if len(selectedSessions) > 0 {
-			sessions = environ.SelectSessions(selectedSessions...)
-		}
-
-		for _, session := range sessions {
-			if err := environ.syncSession(ctx, session, syncSymbols...); err != nil {
-				return err
-			}
-
-			if userConfig[0].Sync.DepositHistory {
-				if err := environ.SyncService.SyncDepositHistory(ctx, session.Exchange); err != nil {
-					return err
-				}
-			}
-
-			if userConfig[0].Sync.WithdrawHistory {
-				if err := environ.SyncService.SyncWithdrawHistory(ctx, session.Exchange); err != nil {
-					return err
-				}
-			}
-
-			if userConfig[0].Sync.RewardHistory {
-				if err := environ.SyncService.SyncRewardHistory(ctx, session.Exchange); err != nil {
-					return err
-				}
-			}
-		}
-
-		return nil
+		return environ.syncWithUserConfig(ctx, userConfig[0])
 	}
 
 	// the default sync logics
@@ -622,31 +492,32 @@ func (environ *Environment) Sync(ctx context.Context, userConfig ...*Config) err
 		if err := environ.syncSession(ctx, session); err != nil {
 			return err
 		}
-
-		if len(userConfig) == 0 || userConfig[0].Sync == nil {
-			continue
-		}
-
-		if userConfig[0].Sync.DepositHistory {
-			if err := environ.SyncService.SyncDepositHistory(ctx, session.Exchange); err != nil {
-				return err
-			}
-		}
-
-		if userConfig[0].Sync.WithdrawHistory {
-			if err := environ.SyncService.SyncWithdrawHistory(ctx, session.Exchange); err != nil {
-				return err
-			}
-		}
-
-		if userConfig[0].Sync.RewardHistory {
-			if err := environ.SyncService.SyncRewardHistory(ctx, session.Exchange); err != nil {
-				return err
-			}
-		}
 	}
 
 	return nil
+}
+
+func (environ *Environment) RecordAsset(t time.Time, session *ExchangeSession, assets types.AssetMap) {
+	// skip for back-test
+	if environ.BacktestService != nil {
+		return
+	}
+
+	if environ.DatabaseService == nil || environ.AccountService == nil {
+		return
+	}
+
+	if err := environ.AccountService.InsertAsset(
+		t,
+		session.Name,
+		session.ExchangeName,
+		session.SubAccount,
+		session.Margin,
+		session.IsolatedMargin,
+		session.IsolatedMarginSymbol,
+		assets); err != nil {
+		log.WithError(err).Errorf("can not insert asset record")
+	}
 }
 
 func (environ *Environment) RecordPosition(position *types.Position, trade types.Trade, profit *types.Profit) {
@@ -659,12 +530,15 @@ func (environ *Environment) RecordPosition(position *types.Position, trade types
 		return
 	}
 
-	if position.Strategy == "" && profit.Strategy != "" {
-		position.Strategy = profit.Strategy
-	}
+	// set profit info to position
+	if profit != nil {
+		if position.Strategy == "" && profit.Strategy != "" {
+			position.Strategy = profit.Strategy
+		}
 
-	if position.StrategyInstanceID == "" && profit.StrategyInstanceID != "" {
-		position.StrategyInstanceID = profit.StrategyInstanceID
+		if position.StrategyInstanceID == "" && profit.StrategyInstanceID != "" {
+			position.StrategyInstanceID = profit.StrategyInstanceID
+		}
 	}
 
 	if profit != nil {
@@ -677,17 +551,6 @@ func (environ *Environment) RecordPosition(position *types.Position, trade types
 	} else {
 		if err := environ.PositionService.Insert(position, trade, fixedpoint.Zero); err != nil {
 			log.WithError(err).Errorf("can not insert position record")
-		}
-	}
-
-	// if:
-	// 1) we are not using sync
-	// 2) and not sync-ing trades from the user data stream
-	if environ.TradeService != nil && (environ.syncConfig == nil ||
-		(environ.syncConfig.UserDataStream == nil) ||
-		(environ.syncConfig.UserDataStream != nil && !environ.syncConfig.UserDataStream.Trades)) {
-		if err := environ.TradeService.Insert(trade); err != nil {
-			log.WithError(err).Errorf("can not insert trade record: %+v", trade)
 		}
 	}
 }
@@ -736,24 +599,12 @@ func (environ *Environment) syncSession(ctx context.Context, session *ExchangeSe
 }
 
 func (environ *Environment) ConfigureNotificationSystem(userConfig *Config) error {
-	environ.Notifiability = Notifiability{
-		SymbolChannelRouter:  NewPatternChannelRouter(nil),
-		SessionChannelRouter: NewPatternChannelRouter(nil),
-		ObjectChannelRouter:  NewObjectChannelRouter(),
-	}
-
 	// setup default notification config
 	if userConfig.Notifications == nil {
-		userConfig.Notifications = &NotificationConfig{
-			Routing: &SlackNotificationRouting{
-				Trade:       "$session",
-				Order:       "$silent",
-				SubmitOrder: "$silent",
-			},
-		}
+		userConfig.Notifications = &NotificationConfig{}
 	}
 
-	var persistence = environ.PersistenceServiceFacade.Get()
+	var persistence = persistenceServiceFacade.Get()
 
 	err := environ.setupInteraction(persistence)
 	if err != nil {
@@ -775,8 +626,34 @@ func (environ *Environment) ConfigureNotificationSystem(userConfig *Config) erro
 	}
 
 	if userConfig.Notifications != nil {
-		if err := environ.ConfigureNotificationRouting(userConfig.Notifications); err != nil {
+		if err := environ.ConfigureNotification(userConfig.Notifications); err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+func (environ *Environment) ConfigureNotification(config *NotificationConfig) error {
+	if config.Switches != nil {
+		if config.Switches.Trade {
+			tradeHandler := func(trade types.Trade) {
+				Notify(trade)
+			}
+
+			for _, session := range environ.sessions {
+				session.UserDataStream.OnTradeUpdate(tradeHandler)
+			}
+		}
+
+		if config.Switches.OrderUpdate {
+			orderUpdateHandler := func(order types.Order) {
+				Notify(order)
+			}
+
+			for _, session := range environ.sessions {
+				session.UserDataStream.OnOrderUpdate(orderUpdateHandler)
+			}
 		}
 	}
 
@@ -803,7 +680,7 @@ func getAuthStoreID() string {
 }
 
 func (environ *Environment) setupInteraction(persistence service.PersistenceService) error {
-	var otpQRCodeImagePath = fmt.Sprintf("otp.png")
+	var otpQRCodeImagePath = "otp.png"
 	var key *otp.Key
 	var keyURL string
 	var authStore = environ.getAuthStore(persistence)
@@ -872,10 +749,11 @@ func (environ *Environment) setupInteraction(persistence service.PersistenceServ
 	}
 
 	interact.AddCustomInteraction(&interact.AuthInteract{
-		Strict:             authStrict,
-		Mode:               authMode,
-		Token:              authToken, // can be empty string here
-		OneTimePasswordKey: key,       // can be nil here
+		Strict: authStrict,
+		Mode:   authMode,
+		Token:  authToken, // can be empty string here
+		// pragma: allowlist nextline secret
+		OneTimePasswordKey: key, // can be nil here
 	})
 	return nil
 }
@@ -898,7 +776,7 @@ func (environ *Environment) setupSlack(userConfig *Config, slackToken string, pe
 
 	// app-level token (for specific api)
 	slackAppToken := viper.GetString("slack-app-token")
-	if !strings.HasPrefix(slackAppToken, "xapp-") {
+	if len(slackAppToken) > 0 && !strings.HasPrefix(slackAppToken, "xapp-") {
 		log.Errorf("SLACK_APP_TOKEN must have the prefix \"xapp-\".")
 		return
 	}
@@ -912,7 +790,10 @@ func (environ *Environment) setupSlack(userConfig *Config, slackToken string, pe
 
 	var slackOpts = []slack.Option{
 		slack.OptionLog(stdlog.New(os.Stdout, "api: ", stdlog.Lshortfile|stdlog.LstdFlags)),
-		slack.OptionAppLevelToken(slackAppToken),
+	}
+
+	if len(slackAppToken) > 0 {
+		slackOpts = append(slackOpts, slack.OptionAppLevelToken(slackAppToken))
 	}
 
 	if b, ok := util.GetEnvVarBool("DEBUG_SLACK"); ok {
@@ -922,7 +803,7 @@ func (environ *Environment) setupSlack(userConfig *Config, slackToken string, pe
 	var client = slack.New(slackToken, slackOpts...)
 
 	var notifier = slacknotifier.New(client, conf.DefaultChannel)
-	environ.AddNotifier(notifier)
+	Notification.AddNotifier(notifier)
 
 	// allocate a store, so that we can save the chatID for the owner
 	var messenger = interact.NewSlack(client)
@@ -974,7 +855,9 @@ func (environ *Environment) setupTelegram(userConfig *Config, telegramBotToken s
 	}
 
 	var notifier = telegramnotifier.New(bot, opts...)
-	environ.Notifiability.AddNotifier(notifier)
+	Notification.AddNotifier(notifier)
+
+	log.AddHook(telegramnotifier.NewLogHook(notifier))
 
 	// allocate a store, so that we can save the chatID for the owner
 	var messenger = interact.NewTelegram(bot)
@@ -1065,7 +948,7 @@ To scan your OTP QR code, please run the following command:
 	
 	open %s
 
-For telegram, send the auth command with the generated one-time password to the bbo bot you created to enable the notification:
+For telegram, send the auth command with the generated one-time password to the bbgo bot you created to enable the notification:
 
 	/auth
 

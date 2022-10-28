@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime/pprof"
 	"syscall"
 	"time"
 
@@ -30,11 +29,11 @@ func init() {
 	RunCmd.Flags().Bool("enable-webserver", false, "enable webserver")
 	RunCmd.Flags().Bool("enable-web-server", false, "legacy option, this is renamed to --enable-webserver")
 	RunCmd.Flags().String("webserver-bind", ":8080", "webserver binding")
+	RunCmd.Flags().Bool("lightweight", false, "lightweight mode")
 
 	RunCmd.Flags().Bool("enable-grpc", false, "enable grpc server")
 	RunCmd.Flags().String("grpc-bind", ":50051", "grpc server binding")
 
-	RunCmd.Flags().String("cpu-profile", "", "cpu profile")
 	RunCmd.Flags().Bool("setup", false, "use setup mode")
 	RootCmd.AddCommand(RunCmd)
 }
@@ -79,47 +78,10 @@ func runSetup(baseCtx context.Context, userConfig *bbgo.Config, enableApiServer 
 	cmdutil.WaitForSignal(ctx, syscall.SIGINT, syscall.SIGTERM)
 	cancelTrading()
 
-	// graceful period = 15 second
-	shutdownCtx, cancelShutdown := context.WithDeadline(ctx, time.Now().Add(15*time.Second))
-
-	log.Infof("shutting down...")
-	trader.Graceful.Shutdown(shutdownCtx)
+	gracefulShutdownPeriod := 30 * time.Second
+	shtCtx, cancelShutdown := context.WithTimeout(bbgo.NewTodoContextWithExistingIsolation(ctx), gracefulShutdownPeriod)
+	bbgo.Shutdown(shtCtx)
 	cancelShutdown()
-	return nil
-}
-
-func BootstrapBacktestEnvironment(ctx context.Context, environ *bbgo.Environment, userConfig *bbgo.Config) error {
-	if err := environ.ConfigureDatabase(ctx); err != nil {
-		return err
-	}
-
-	environ.Notifiability = bbgo.Notifiability{
-		SymbolChannelRouter:  bbgo.NewPatternChannelRouter(nil),
-		SessionChannelRouter: bbgo.NewPatternChannelRouter(nil),
-		ObjectChannelRouter:  bbgo.NewObjectChannelRouter(),
-	}
-
-	return nil
-}
-
-func BootstrapEnvironment(ctx context.Context, environ *bbgo.Environment, userConfig *bbgo.Config) error {
-	if err := environ.ConfigureDatabase(ctx); err != nil {
-		return err
-	}
-
-	if err := environ.ConfigureExchangeSessions(userConfig); err != nil {
-		return errors.Wrap(err, "exchange session configure error")
-	}
-
-	if userConfig.Persistence != nil {
-		if err := environ.ConfigurePersistence(userConfig.Persistence); err != nil {
-			return errors.Wrap(err, "persistence configure error")
-		}
-	}
-
-	if err := environ.ConfigureNotificationSystem(userConfig); err != nil {
-		return errors.Wrap(err, "notification configure error")
-	}
 
 	return nil
 }
@@ -166,8 +128,20 @@ func runConfig(basectx context.Context, cmd *cobra.Command, userConfig *bbgo.Con
 	defer cancelTrading()
 
 	environ := bbgo.NewEnvironment()
-	if err := BootstrapEnvironment(ctx, environ, userConfig); err != nil {
+
+	lightweight, err := cmd.Flags().GetBool("lightweight")
+	if err != nil {
 		return err
+	}
+
+	if lightweight {
+		if err := bbgo.BootstrapEnvironmentLightweight(ctx, environ, userConfig); err != nil {
+			return err
+		}
+	} else {
+		if err := bbgo.BootstrapEnvironment(ctx, environ, userConfig); err != nil {
+			return err
+		}
 	}
 
 	if err := environ.Init(ctx); err != nil {
@@ -186,6 +160,10 @@ func runConfig(basectx context.Context, cmd *cobra.Command, userConfig *bbgo.Con
 
 	trader := bbgo.NewTrader(environ)
 	if err := trader.Configure(userConfig); err != nil {
+		return err
+	}
+
+	if err := trader.LoadState(); err != nil {
 		return err
 	}
 
@@ -223,10 +201,14 @@ func runConfig(basectx context.Context, cmd *cobra.Command, userConfig *bbgo.Con
 	cmdutil.WaitForSignal(ctx, syscall.SIGINT, syscall.SIGTERM)
 	cancelTrading()
 
-	log.Infof("shutting down...")
-	shutdownCtx, cancelShutdown := context.WithDeadline(ctx, time.Now().Add(30*time.Second))
-	trader.Graceful.Shutdown(shutdownCtx)
+	gracefulShutdownPeriod := 30 * time.Second
+	shtCtx, cancelShutdown := context.WithTimeout(bbgo.NewTodoContextWithExistingIsolation(ctx), gracefulShutdownPeriod)
+	bbgo.Shutdown(shtCtx)
 	cancelShutdown()
+
+	if err := trader.SaveState(); err != nil {
+		log.WithError(err).Errorf("can not save strategy states")
+	}
 
 	for _, session := range environ.Sessions() {
 		if err := session.MarketDataStream.Close(); err != nil {
@@ -252,11 +234,6 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	configFile, err := cmd.Flags().GetString("config")
-	if err != nil {
-		return err
-	}
-
-	cpuProfile, err := cmd.Flags().GetString("cpu-profile")
 	if err != nil {
 		return err
 	}
@@ -290,20 +267,6 @@ func run(cmd *cobra.Command, args []string) error {
 		userConfig, err = bbgo.Load(configFile, true)
 		if err != nil {
 			return err
-		}
-
-		if cpuProfile != "" {
-			f, err := os.Create(cpuProfile)
-			if err != nil {
-				log.Fatal("could not create CPU profile: ", err)
-			}
-			defer f.Close() // error handling omitted for example
-
-			if err := pprof.StartCPUProfile(f); err != nil {
-				log.Fatal("could not start CPU profile: ", err)
-			}
-
-			defer pprof.StopCPUProfile()
 		}
 
 		return runConfig(ctx, cmd, userConfig)

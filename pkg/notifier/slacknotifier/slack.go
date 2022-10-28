@@ -1,6 +1,7 @@
 package slacknotifier
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -150,33 +151,10 @@ func (n *Notifier) NotifyTo(channel string, obj interface{}, args ...interface{}
 	}
 }
 
-/*
-func (n *Notifier) NotifyTrade(trade *types.Trade) {
-	_, _, err := n.client.PostMessageContext(context.Background(), n.TradeChannel,
-		slack.MsgOptionText(util.Render(`:handshake: {{ .Symbol }} {{ .Side }} Trade Execution @ {{ .Price  }}`, trade), true),
-		slack.MsgOptionAttachments(trade.SlackAttachment()))
-
-	if err != nil {
-		logrus.WithError(err).Error("slack send error")
-	}
+func (n *Notifier) SendPhoto(buffer *bytes.Buffer) {
+	n.SendPhotoTo(n.channel, buffer)
 }
-*/
 
-/*
-func (n *Notifier) NotifyPnL(report *pnl.AverageCostPnlReport) {
-	attachment := report.SlackAttachment()
-
-	_, _, err := n.client.PostMessageContext(context.Background(), n.PnlChannel,
-		slack.MsgOptionText(util.Render(
-			`:heavy_dollar_sign: Here is your *{{ .symbol }}* PnL report collected since *{{ .startTime }}*`,
-			map[string]interface{}{
-				"symbol":    report.Symbol,
-				"startTime": report.StartTime.Format(time.RFC822),
-			}), true),
-		slack.MsgOptionAttachments(attachment))
-
-	if err != nil {
-		logrus.WithError(err).Errorf("slack send error")
-	}
+func (n *Notifier) SendPhotoTo(channel string, buffer *bytes.Buffer) {
+	// TODO
 }
-*/

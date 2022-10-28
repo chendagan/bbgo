@@ -34,7 +34,7 @@ func toSubscriptions(sub *pb.Subscription) (types.Subscription, error) {
 			Symbol:  sub.Symbol,
 			Channel: types.KLineChannel,
 			Options: types.SubscribeOptions{
-				Interval: sub.Interval,
+				Interval: types.Interval(sub.Interval),
 			},
 		}, nil
 	}
@@ -97,14 +97,14 @@ func toSide(side pb.Side) types.SideType {
 func toSubmitOrders(pbOrders []*pb.SubmitOrder) (submitOrders []types.SubmitOrder) {
 	for _, pbOrder := range pbOrders {
 		submitOrders = append(submitOrders, types.SubmitOrder{
-			ClientOrderID:    pbOrder.ClientOrderId,
-			Symbol:           pbOrder.Symbol,
-			Side:             toSide(pbOrder.Side),
-			Type:             toOrderType(pbOrder.OrderType),
-			Price:            fixedpoint.MustNewFromString(pbOrder.Price),
-			Quantity:         fixedpoint.MustNewFromString(pbOrder.Quantity),
-			StopPrice:        fixedpoint.MustNewFromString(pbOrder.StopPrice),
-			TimeInForce:      "",
+			ClientOrderID: pbOrder.ClientOrderId,
+			Symbol:        pbOrder.Symbol,
+			Side:          toSide(pbOrder.Side),
+			Type:          toOrderType(pbOrder.OrderType),
+			Price:         fixedpoint.MustNewFromString(pbOrder.Price),
+			Quantity:      fixedpoint.MustNewFromString(pbOrder.Quantity),
+			StopPrice:     fixedpoint.MustNewFromString(pbOrder.StopPrice),
+			TimeInForce:   "",
 		})
 	}
 

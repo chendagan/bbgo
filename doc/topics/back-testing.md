@@ -17,8 +17,18 @@ backtest:
   # the symbol data that you want to sync and back-test
   symbols:
   - BTCUSDT
+
+  sessions:
+  - binance
   
-  account:
+  # feeMode is optional
+  # valid values are: quote, native, token
+  #   quote: always deduct fee from the quote balance
+  #   native: the crypto exchange fee deduction, base fee for buy order, quote fee for sell order.
+  #   token: count fee as crypto exchange fee token
+  # feeMode: quote
+  
+  accounts:
     # the initial account balance you want to start with
     binance: # exchange name
       balances:
@@ -32,6 +42,12 @@ Note on date formats, the following date formats are supported:
 * You can also use `2021-11-26T15:04:56`
 
 And then, you can sync remote exchange k-lines (candle bars) data for back-testing:
+
+```sh
+bbgo backtest -v --sync --config config/grid.yaml
+```
+
+To customize the sync data range, add `--sync-from`:
 
 ```sh
 bbgo backtest -v --sync --sync-only --sync-from 2020-11-01 --config config/grid.yaml

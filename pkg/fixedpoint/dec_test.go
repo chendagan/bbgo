@@ -1,10 +1,11 @@
 package fixedpoint
 
 import (
+	"encoding/json"
+	"github.com/stretchr/testify/assert"
+	"gopkg.in/yaml.v3"
 	"math/big"
 	"testing"
-	"github.com/stretchr/testify/assert"
-	"encoding/json"
 )
 
 const Delta = 1e-9
@@ -16,7 +17,7 @@ func BenchmarkMul(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			x := NewFromFloat(20.0)
 			y := NewFromFloat(20.0)
-			x = x.Mul(y)
+			x = x.Mul(y) // nolint
 		}
 	})
 
@@ -24,7 +25,7 @@ func BenchmarkMul(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			x := NewFromFloat(88.12345678)
 			y := NewFromFloat(88.12345678)
-			x = x.Mul(y)
+			x = x.Mul(y) // nolint
 		}
 	})
 
@@ -32,7 +33,7 @@ func BenchmarkMul(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			x := big.NewFloat(20.0)
 			y := big.NewFloat(20.0)
-			x = new(big.Float).Mul(x, y)
+			x = new(big.Float).Mul(x, y) // nolint
 		}
 	})
 
@@ -40,7 +41,7 @@ func BenchmarkMul(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			x := big.NewFloat(88.12345678)
 			y := big.NewFloat(88.12345678)
-			x = new(big.Float).Mul(x, y)
+			x = new(big.Float).Mul(x, y) // nolint
 		}
 	})
 }
@@ -69,6 +70,15 @@ func TestNew(t *testing.T) {
 	assert.Equal(t, "0.0010", f.FormatString(4))
 	assert.Equal(t, "0.1%", f.Percentage())
 	assert.Equal(t, "0.10%", f.FormatPercentage(2))
+	f = NewFromFloat(0.1)
+	assert.Equal(t, "10%", f.Percentage())
+	assert.Equal(t, "10%", f.FormatPercentage(0))
+	f = NewFromFloat(0.01)
+	assert.Equal(t, "1%", f.Percentage())
+	assert.Equal(t, "1%", f.FormatPercentage(0))
+	f = NewFromFloat(0.111)
+	assert.Equal(t, "11.1%", f.Percentage())
+	assert.Equal(t, "11.1%", f.FormatPercentage(1))
 }
 
 func TestFormatString(t *testing.T) {
@@ -128,6 +138,15 @@ func TestFromString(t *testing.T) {
 	assert.Equal(t, Zero, f)
 	f = MustNewFromString("")
 	assert.Equal(t, Zero, f)
+
+	for _, s := range []string{"inf", "Inf", "INF", "iNF"} {
+		f = MustNewFromString(s)
+		assert.Equal(t, PosInf, f)
+		f = MustNewFromString("+" + s)
+		assert.Equal(t, PosInf, f)
+		f = MustNewFromString("-" + s)
+		assert.Equal(t, NegInf, f)
+	}
 }
 
 func TestJson(t *testing.T) {
@@ -158,16 +177,62 @@ func TestJson(t *testing.T) {
 	assert.Equal(t, "0.00000000", p.FormatString(8))
 	assert.Equal(t, "0.00000000", string(e))
 
-
 	_ = json.Unmarshal([]byte("0.00153917575"), &p)
 	assert.Equal(t, "0.00153917", p.FormatString(8))
 
-	var q Value
-	q = NewFromFloat(0.00153917575)
+	q := NewFromFloat(0.00153917575)
 	assert.Equal(t, p, q)
 	_ = json.Unmarshal([]byte("6e-8"), &p)
 	_ = json.Unmarshal([]byte("0.000062"), &q)
 	assert.Equal(t, "0.00006194", q.Sub(p).String())
+
+	assert.NoError(t, json.Unmarshal([]byte(`"inf"`), &p))
+	assert.NoError(t, json.Unmarshal([]byte(`"+Inf"`), &q))
+	assert.Equal(t, PosInf, p)
+	assert.Equal(t, p, q)
+}
+
+func TestYaml(t *testing.T) {
+	p := MustNewFromString("0")
+	e, err := yaml.Marshal(p)
+	assert.NoError(t, err)
+	assert.Equal(t, "\"0.00000000\"\n", string(e))
+	p = MustNewFromString("1.00000003")
+	e, err = yaml.Marshal(p)
+	assert.NoError(t, err)
+	assert.Equal(t, "\"1.00000003\"\n", string(e))
+	p = MustNewFromString("1.000000003")
+	e, err = yaml.Marshal(p)
+	assert.NoError(t, err)
+	assert.Equal(t, "\"1.00000000\"\n", string(e))
+	p = MustNewFromString("1.000000008")
+	e, err = yaml.Marshal(p)
+	assert.NoError(t, err)
+	assert.Equal(t, "\"1.00000000\"\n", string(e))
+	p = MustNewFromString("0.999999999")
+	e, err = yaml.Marshal(p)
+	assert.NoError(t, err)
+	assert.Equal(t, "\"0.99999999\"\n", string(e))
+
+	p = MustNewFromString("1.2e-9")
+	e, err = yaml.Marshal(p)
+	assert.NoError(t, err)
+	assert.Equal(t, "0.00000000", p.FormatString(8))
+	assert.Equal(t, "\"0.00000000\"\n", string(e))
+
+	_ = yaml.Unmarshal([]byte("0.00153917575"), &p)
+	assert.Equal(t, "0.00153917", p.FormatString(8))
+
+	q := NewFromFloat(0.00153917575)
+	assert.Equal(t, p, q)
+	_ = yaml.Unmarshal([]byte("6e-8"), &p)
+	_ = yaml.Unmarshal([]byte("0.000062"), &q)
+	assert.Equal(t, "0.00006194", q.Sub(p).String())
+
+	assert.NoError(t, json.Unmarshal([]byte(`"inf"`), &p))
+	assert.NoError(t, json.Unmarshal([]byte(`"+Inf"`), &q))
+	assert.Equal(t, PosInf, p)
+	assert.Equal(t, p, q)
 }
 
 func TestNumFractionalDigits(t *testing.T) {

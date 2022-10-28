@@ -12,20 +12,42 @@ import (
 type AverageCostCalculator struct {
 	TradingFeeCurrency string
 	Market             types.Market
+	ExchangeFee        *types.ExchangeFee
 }
 
-func (c *AverageCostCalculator) Calculate(symbol string, trades []types.Trade, currentPrice fixedpoint.Value) *AverageCostPnlReport {
+func (c *AverageCostCalculator) Calculate(symbol string, trades []types.Trade, currentPrice fixedpoint.Value) *AverageCostPnLReport {
 	// copy trades, so that we can truncate it.
 	var bidVolume = fixedpoint.Zero
 	var askVolume = fixedpoint.Zero
 	var feeUSD = fixedpoint.Zero
+	var grossProfit = fixedpoint.Zero
+	var grossLoss = fixedpoint.Zero
+
+	var position = types.NewPositionFromMarket(c.Market)
+
+	if c.ExchangeFee != nil {
+		position.SetFeeRate(*c.ExchangeFee)
+	} else {
+		makerFeeRate := 0.075 * 0.01
+
+		if c.Market.QuoteCurrency == "BUSD" {
+			makerFeeRate = 0
+		}
+
+		position.SetFeeRate(types.ExchangeFee{
+			// binance vip 0 uses 0.075%
+			MakerFeeRate: fixedpoint.NewFromFloat(makerFeeRate),
+			TakerFeeRate: fixedpoint.NewFromFloat(0.075 * 0.01),
+		})
+	}
 
 	if len(trades) == 0 {
-		return &AverageCostPnlReport{
+		return &AverageCostPnLReport{
 			Symbol:     symbol,
 			Market:     c.Market,
 			LastPrice:  currentPrice,
 			NumTrades:  0,
+			Position:   position,
 			BuyVolume:  bidVolume,
 			SellVolume: askVolume,
 			FeeInUSD:   feeUSD,
@@ -33,13 +55,6 @@ func (c *AverageCostCalculator) Calculate(symbol string, trades []types.Trade, c
 	}
 
 	var currencyFees = map[string]fixedpoint.Value{}
-
-	var position = types.NewPositionFromMarket(c.Market)
-	position.SetFeeRate(types.ExchangeFee{
-		// binance vip 0 uses 0.075%
-		MakerFeeRate: fixedpoint.NewFromFloat(0.075 * 0.01),
-		TakerFeeRate: fixedpoint.NewFromFloat(0.075 * 0.01),
-	})
 
 	// TODO: configure the exchange fee rate here later
 	// position.SetExchangeFeeRate()
@@ -64,6 +79,12 @@ func (c *AverageCostCalculator) Calculate(symbol string, trades []types.Trade, c
 			totalNetProfit = totalNetProfit.Add(netProfit)
 		}
 
+		if profit.Sign() > 0 {
+			grossProfit = grossProfit.Add(profit)
+		} else if profit.Sign() < 0 {
+			grossLoss = grossLoss.Add(profit)
+		}
+
 		if trade.IsBuyer {
 			bidVolume = bidVolume.Add(trade.Quantity)
 		} else {
@@ -81,22 +102,28 @@ func (c *AverageCostCalculator) Calculate(symbol string, trades []types.Trade, c
 
 	unrealizedProfit := currentPrice.Sub(position.AverageCost).
 		Mul(position.GetBase())
-	return &AverageCostPnlReport{
+
+	return &AverageCostPnLReport{
 		Symbol:    symbol,
 		Market:    c.Market,
 		LastPrice: currentPrice,
 		NumTrades: len(trades),
 		StartTime: time.Time(trades[0].Time),
+		Position:  position,
 
 		BuyVolume:  bidVolume,
 		SellVolume: askVolume,
 
-		Stock:            position.GetBase(),
-		Profit:           totalProfit,
-		NetProfit:        totalNetProfit,
-		UnrealizedProfit: unrealizedProfit,
-		AverageCost:      position.AverageCost,
-		FeeInUSD:         totalProfit.Sub(totalNetProfit),
-		CurrencyFees:     currencyFees,
+		BaseAssetPosition: position.GetBase(),
+		Profit:            totalProfit,
+		NetProfit:         totalNetProfit,
+		UnrealizedProfit:  unrealizedProfit,
+
+		GrossProfit: grossProfit,
+		GrossLoss:   grossLoss,
+
+		AverageCost:  position.AverageCost,
+		FeeInUSD:     totalProfit.Sub(totalNetProfit),
+		CurrencyFees: currencyFees,
 	}
 }

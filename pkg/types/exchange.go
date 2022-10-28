@@ -40,15 +40,22 @@ func (n ExchangeName) String() string {
 }
 
 const (
-	ExchangeMax      = ExchangeName("max")
-	ExchangeBinance  = ExchangeName("binance")
-	ExchangeFTX      = ExchangeName("ftx")
-	ExchangeOKEx     = ExchangeName("okex")
-	ExchangeKucoin   = ExchangeName("kucoin")
-	ExchangeBacktest = ExchangeName("backtest")
+	ExchangeMax      ExchangeName = "max"
+	ExchangeBinance  ExchangeName = "binance"
+	ExchangeFTX      ExchangeName = "ftx"
+	ExchangeOKEx     ExchangeName = "okex"
+	ExchangeKucoin   ExchangeName = "kucoin"
+	ExchangeBacktest ExchangeName = "backtest"
 )
 
-var SupportedExchanges = []ExchangeName{"binance", "max", "ftx", "okex", "kucoin"}
+var SupportedExchanges = []ExchangeName{
+	ExchangeMax,
+	ExchangeBinance,
+	ExchangeFTX,
+	ExchangeOKEx,
+	ExchangeKucoin,
+	// note: we are not using "backtest"
+}
 
 func ValidExchangeName(a string) (ExchangeName, error) {
 	switch strings.ToLower(a) {
@@ -67,6 +74,7 @@ func ValidExchangeName(a string) (ExchangeName, error) {
 	return "", fmt.Errorf("invalid exchange name: %s", a)
 }
 
+//go:generate mockgen -destination=mocks/mock_exchange.go -package=mocks . Exchange
 type Exchange interface {
 	Name() ExchangeName
 
@@ -80,6 +88,7 @@ type Exchange interface {
 // ExchangeOrderQueryService provides an interface for querying the order status via order ID or client order ID
 type ExchangeOrderQueryService interface {
 	QueryOrder(ctx context.Context, q OrderQuery) (*Order, error)
+	QueryOrderTrades(ctx context.Context, q OrderQuery) ([]Trade, error)
 }
 
 type ExchangeTradeService interface {
@@ -87,11 +96,19 @@ type ExchangeTradeService interface {
 
 	QueryAccountBalances(ctx context.Context) (BalanceMap, error)
 
-	SubmitOrders(ctx context.Context, orders ...SubmitOrder) (createdOrders OrderSlice, err error)
+	SubmitOrder(ctx context.Context, order SubmitOrder) (createdOrder *Order, err error)
 
 	QueryOpenOrders(ctx context.Context, symbol string) (orders []Order, err error)
 
 	CancelOrders(ctx context.Context, orders ...Order) error
+}
+
+type ExchangeDefaultFeeRates interface {
+	DefaultFeeRates() ExchangeFee
+}
+
+type ExchangeAmountFeeProtect interface {
+	SetModifyOrderAmountForFee(ExchangeFee)
 }
 
 type ExchangeTradeHistoryService interface {
@@ -122,7 +139,7 @@ type ExchangeTransferService interface {
 }
 
 type ExchangeWithdrawalService interface {
-	Withdrawal(ctx context.Context, asset string, amount fixedpoint.Value, address string, options *WithdrawalOptions) error
+	Withdraw(ctx context.Context, asset string, amount fixedpoint.Value, address string, options *WithdrawalOptions) error
 }
 
 type ExchangeRewardService interface {

@@ -69,23 +69,43 @@ try to create new indicators in `pkg/indicator/` folder, and add compilation hin
 // go:generate callbackgen -type StructName
 type StructName struct {
 	...
-	UpdateCallbacks []func(value float64)
+	updateCallbacks []func(value float64)
 }
 
 ```
 And implement required interface methods:
 ```go
+
+func (inc *StructName) Update(value float64) {
+    // indicator calculation here...
+    // push value...
+}
+
+func (inc *StructName) PushK(k types.KLine) {
+    inc.Update(k.Close.Float64())
+}
+
 // custom function
-func (inc *StructName) calculateAndUpdate(kLines []types.KLine) {
-	// calculation...
-	// assign the result to calculatedValue
-	inc.EmitUpdate(calculatedValue) // produce data, broadcast to the subscribers
+func (inc *StructName) CalculateAndUpdate(kLines []types.KLine) {
+    if len(inc.Values) == 0 {
+        // preload or initialization
+       	for _, k := range allKLines {
+			inc.PushK(k)
+		}
+
+		inc.EmitUpdate(inc.Last())
+    } else {
+        // update new value only
+		k := allKLines[len(allKLines)-1]
+		inc.PushK(k)
+	    inc.EmitUpdate(calculatedValue) // produce data, broadcast to the subscribers
+    }
 }
 
 // custom function
 func (inc *StructName) handleKLineWindowUpdate(interval types.Interval, window types.KLineWindow) {
 	// filter on interval
-	inc.calculateAndUpdate(window)
+	inc.CalculateAndUpdate(window)
 }
 
 // required
@@ -98,3 +118,7 @@ The `KLineWindowUpdater` interface is currently defined in `pkg/indicator/ewma.g
 
 Once the implementation is done, run `go generate` to generate the callback functions of the indicator.
 You should be able to implement your strategy and use the new indicator in the same way as `AD`.
+
+#### Generalize
+
+In order to provide indicator users a lower learning curve, we've designed the `types.Series` interface. We recommend indicator developers to also implement the `types.Series` interface to provide richer functionality on the computed result. To have deeper understanding how `types.Series` works, please refer to [doc/development/series.md](./series.md)

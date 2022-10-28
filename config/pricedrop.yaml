@@ -3,16 +3,10 @@ notifications:
   slack:
     defaultChannel: "bbgo"
     errorChannel: "bbgo-error"
-
-reportPnL:
-- averageCostBySymbols:
-  - "BTCUSDT"
-  - "ETHUSDT"
-  - "BNBUSDT"
-  of: binance
-  when:
-  - "@daily"
-  - "@hourly"
+  switches:
+    trade: true
+    orderUpdate: true
+    submitOrder: true
 
 sessions:
   binance:
@@ -46,8 +40,8 @@ backtest:
   - BTCUSDT
   account:
     binance:
-      makerFeeRate: 15
-      takerFeeRate: 15
+      makerFeeRate: 0.075%
+      takerFeeRate: 0.075%
       balances:
         BTC: 0.1
         USDT: 10000.0

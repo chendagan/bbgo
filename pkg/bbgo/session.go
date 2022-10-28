@@ -7,161 +7,27 @@ import (
 	"sync"
 	"time"
 
-	"github.com/c9s/bbgo/pkg/cache"
+	"github.com/slack-go/slack"
 
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 
-	"github.com/c9s/bbgo/pkg/cmd/cmdutil"
+	"github.com/c9s/bbgo/pkg/cache"
+	"github.com/c9s/bbgo/pkg/util/templateutil"
+
+	exchange2 "github.com/c9s/bbgo/pkg/exchange"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
-	"github.com/c9s/bbgo/pkg/indicator"
 	"github.com/c9s/bbgo/pkg/service"
 	"github.com/c9s/bbgo/pkg/types"
 	"github.com/c9s/bbgo/pkg/util"
 )
 
-var (
-	debugEWMA = false
-	debugSMA  = false
-)
-
-func init() {
-	// when using --dotenv option, the dotenv is loaded from command.PersistentPreRunE, not init.
-	// hence here the env var won't enable the debug flag
-	util.SetEnvVarBool("DEBUG_EWMA", &debugEWMA)
-	util.SetEnvVarBool("DEBUG_SMA", &debugSMA)
-}
-
-type StandardIndicatorSet struct {
-	Symbol string
-	// Standard indicators
-	// interval -> window
-	sma        map[types.IntervalWindow]*indicator.SMA
-	ewma       map[types.IntervalWindow]*indicator.EWMA
-	boll       map[types.IntervalWindowBandWidth]*indicator.BOLL
-	stoch      map[types.IntervalWindow]*indicator.STOCH
-	volatility map[types.IntervalWindow]*indicator.VOLATILITY
-
-	store *MarketDataStore
-}
-
-func NewStandardIndicatorSet(symbol string, store *MarketDataStore) *StandardIndicatorSet {
-	set := &StandardIndicatorSet{
-		Symbol:     symbol,
-		sma:        make(map[types.IntervalWindow]*indicator.SMA),
-		ewma:       make(map[types.IntervalWindow]*indicator.EWMA),
-		boll:       make(map[types.IntervalWindowBandWidth]*indicator.BOLL),
-		stoch:      make(map[types.IntervalWindow]*indicator.STOCH),
-		volatility: make(map[types.IntervalWindow]*indicator.VOLATILITY),
-		store:      store,
-	}
-
-	// let us pre-defined commonly used intervals
-	for interval := range types.SupportedIntervals {
-		for _, window := range []int{7, 25, 99} {
-			iw := types.IntervalWindow{Interval: interval, Window: window}
-			set.sma[iw] = &indicator.SMA{IntervalWindow: iw}
-			set.sma[iw].Bind(store)
-			if debugSMA {
-				set.sma[iw].OnUpdate(func(value float64) {
-					log.Infof("%s SMA %s: %f", symbol, iw.String(), value)
-				})
-			}
-
-			set.ewma[iw] = &indicator.EWMA{IntervalWindow: iw}
-			set.ewma[iw].Bind(store)
-
-			// if debug EWMA is enabled, we add the debug handler
-			if debugEWMA {
-				set.ewma[iw].OnUpdate(func(value float64) {
-					log.Infof("%s EWMA %s: %f", symbol, iw.String(), value)
-				})
-			}
-
-		}
-
-		// setup boll indicator, we may refactor boll indicator by subscribing SMA indicator,
-		// however, since general used BOLLINGER band use window 21, which is not in the existing SMA indicator sets.
-		// Pull out the bandwidth configuration as the boll Key
-		iw := types.IntervalWindow{Interval: interval, Window: 21}
-
-		// set efault band width to 2.0
-		iwb := types.IntervalWindowBandWidth{IntervalWindow: iw, BandWidth: 2.0}
-		set.boll[iwb] = &indicator.BOLL{IntervalWindow: iw, K: iwb.BandWidth}
-		set.boll[iwb].Bind(store)
-	}
-
-	return set
-}
-
-// BOLL returns the bollinger band indicator of the given interval, the window and bandwidth
-func (set *StandardIndicatorSet) BOLL(iw types.IntervalWindow, bandWidth float64) *indicator.BOLL {
-	iwb := types.IntervalWindowBandWidth{IntervalWindow: iw, BandWidth: bandWidth}
-	inc, ok := set.boll[iwb]
-	if !ok {
-		inc = &indicator.BOLL{IntervalWindow: iw, K: bandWidth}
-		inc.Bind(set.store)
-		set.boll[iwb] = inc
-	}
-
-	return inc
-}
-
-// SMA returns the simple moving average indicator of the given interval and the window size.
-func (set *StandardIndicatorSet) SMA(iw types.IntervalWindow) *indicator.SMA {
-	inc, ok := set.sma[iw]
-	if !ok {
-		inc = &indicator.SMA{IntervalWindow: iw}
-		inc.Bind(set.store)
-		set.sma[iw] = inc
-	}
-
-	return inc
-}
-
-// EWMA returns the exponential weighed moving average indicator of the given interval and the window size.
-func (set *StandardIndicatorSet) EWMA(iw types.IntervalWindow) *indicator.EWMA {
-	inc, ok := set.ewma[iw]
-	if !ok {
-		inc = &indicator.EWMA{IntervalWindow: iw}
-		inc.Bind(set.store)
-		set.ewma[iw] = inc
-	}
-
-	return inc
-}
-
-func (set *StandardIndicatorSet) STOCH(iw types.IntervalWindow) *indicator.STOCH {
-	inc, ok := set.stoch[iw]
-	if !ok {
-		inc = &indicator.STOCH{IntervalWindow: iw}
-		inc.Bind(set.store)
-		set.stoch[iw] = inc
-	}
-
-	return inc
-}
-
-// VOLATILITY returns the volatility(stddev) indicator of the given interval and the window size.
-func (set *StandardIndicatorSet) VOLATILITY(iw types.IntervalWindow) *indicator.VOLATILITY {
-	inc, ok := set.volatility[iw]
-	if !ok {
-		inc = &indicator.VOLATILITY{IntervalWindow: iw}
-		inc.Bind(set.store)
-		set.volatility[iw] = inc
-	}
-
-	return inc
-}
+var KLinePreloadLimit int64 = 1000
 
 // ExchangeSession presents the exchange connection Session
 // It also maintains and collects the data returned from the stream.
 type ExchangeSession struct {
-	// exchange Session based notification system
-	// we make it as a value field so that we can configure it separately
-	Notifiability `json:"-" yaml:"-"`
-
 	// ---------------------------
 	// Session config fields
 	// ---------------------------
@@ -176,9 +42,10 @@ type ExchangeSession struct {
 	SubAccount   string             `json:"subAccount,omitempty" yaml:"subAccount,omitempty"`
 
 	// Withdrawal is used for enabling withdrawal functions
-	Withdrawal   bool             `json:"withdrawal,omitempty" yaml:"withdrawal,omitempty"`
-	MakerFeeRate fixedpoint.Value `json:"makerFeeRate" yaml:"makerFeeRate"`
-	TakerFeeRate fixedpoint.Value `json:"takerFeeRate" yaml:"takerFeeRate"`
+	Withdrawal              bool             `json:"withdrawal,omitempty" yaml:"withdrawal,omitempty"`
+	MakerFeeRate            fixedpoint.Value `json:"makerFeeRate" yaml:"makerFeeRate"`
+	TakerFeeRate            fixedpoint.Value `json:"takerFeeRate" yaml:"takerFeeRate"`
+	ModifyOrderAmountForFee bool             `json:"modifyOrderAmountForFee" yaml:"modifyOrderAmountForFee"`
 
 	PublicOnly           bool   `json:"publicOnly,omitempty" yaml:"publicOnly"`
 	Margin               bool   `json:"margin,omitempty" yaml:"margin"`
@@ -210,6 +77,8 @@ type ExchangeSession struct {
 	Subscriptions map[types.Subscription]types.Subscription `json:"-" yaml:"-"`
 
 	Exchange types.Exchange `json:"-" yaml:"-"`
+
+	UseHeikinAshi bool `json:"heikinAshi,omitempty" yaml:"heikinAshi,omitempty"`
 
 	// Trades collects the executed trades from the exchange
 	// map: symbol -> []trade
@@ -249,12 +118,6 @@ func NewExchangeSession(name string, exchange types.Exchange) *ExchangeSession {
 	marketDataStream.SetPublicOnly()
 
 	session := &ExchangeSession{
-		Notifiability: Notifiability{
-			SymbolChannelRouter:  NewPatternChannelRouter(nil),
-			SessionChannelRouter: NewPatternChannelRouter(nil),
-			ObjectChannelRouter:  NewObjectChannelRouter(),
-		},
-
 		Name:             name,
 		Exchange:         exchange,
 		UserDataStream:   userDataStream,
@@ -278,8 +141,7 @@ func NewExchangeSession(name string, exchange types.Exchange) *ExchangeSession {
 
 	session.OrderExecutor = &ExchangeOrderExecutor{
 		// copy the notification system so that we can route
-		Notifiability: session.Notifiability,
-		Session:       session,
+		Session: session,
 	}
 
 	return session
@@ -293,15 +155,16 @@ func (session *ExchangeSession) GetAccount() (a *types.Account) {
 }
 
 // UpdateAccount locks the account mutex and update the account object
-func (session *ExchangeSession) UpdateAccount(ctx context.Context) error {
+func (session *ExchangeSession) UpdateAccount(ctx context.Context) (*types.Account, error) {
 	account, err := session.Exchange.QueryAccount(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
 	session.accountMutex.Lock()
 	session.Account = account
 	session.accountMutex.Unlock()
-	return nil
+	return account, nil
 }
 
 // Init initializes the basic data structure and market information by its exchange.
@@ -332,6 +195,32 @@ func (session *ExchangeSession) Init(ctx context.Context, environ *Environment) 
 	}
 
 	session.markets = markets
+
+	if feeRateProvider, ok := session.Exchange.(types.ExchangeDefaultFeeRates); ok {
+		defaultFeeRates := feeRateProvider.DefaultFeeRates()
+		if session.MakerFeeRate.IsZero() {
+			session.MakerFeeRate = defaultFeeRates.MakerFeeRate
+		}
+		if session.TakerFeeRate.IsZero() {
+			session.TakerFeeRate = defaultFeeRates.TakerFeeRate
+		}
+	}
+
+	if session.ModifyOrderAmountForFee {
+		amountProtectExchange, ok := session.Exchange.(types.ExchangeAmountFeeProtect)
+		if !ok {
+			return fmt.Errorf("exchange %s does not support order amount protection", session.ExchangeName.String())
+		}
+
+		fees := types.ExchangeFee{MakerFeeRate: session.MakerFeeRate, TakerFeeRate: session.TakerFeeRate}
+		amountProtectExchange.SetModifyOrderAmountForFee(fees)
+	}
+
+	if session.UseHeikinAshi {
+		session.MarketDataStream = &types.HeikinAshiStream{
+			StandardStreamEmitter: session.MarketDataStream.(types.StandardStreamEmitter),
+		}
+	}
 
 	// query and initialize the balances
 	if !session.PublicOnly {
@@ -387,13 +276,23 @@ func (session *ExchangeSession) Init(ctx context.Context, environ *Environment) 
 	}
 
 	// update last prices
-	session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {
-		if _, ok := session.startPrices[kline.Symbol]; !ok {
-			session.startPrices[kline.Symbol] = kline.Open
-		}
+	if session.UseHeikinAshi {
+		session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {
+			if _, ok := session.startPrices[kline.Symbol]; !ok {
+				session.startPrices[kline.Symbol] = kline.Open
+			}
 
-		session.lastPrices[kline.Symbol] = kline.Close
-	})
+			session.lastPrices[kline.Symbol] = session.MarketDataStream.(*types.HeikinAshiStream).LastOrigin[kline.Symbol][kline.Interval].Close
+		})
+	} else {
+		session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {
+			if _, ok := session.startPrices[kline.Symbol]; !ok {
+				session.startPrices[kline.Symbol] = kline.Open
+			}
+
+			session.lastPrices[kline.Symbol] = kline.Close
+		})
+	}
 
 	session.MarketDataStream.OnMarketTrade(func(trade types.Trade) {
 		session.lastPrices[trade.Symbol] = trade.Price
@@ -445,6 +344,8 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 			trades, err = environ.TradeService.Query(service.QueryTradesOptions{
 				Exchange: session.Exchange.Name(),
 				Symbol:   symbol,
+				Ordering: "DESC",
+				Limit:    100,
 			})
 		}
 
@@ -452,6 +353,7 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 			return err
 		}
 
+		trades = types.SortTradesAscending(trades)
 		log.Infof("symbol %s: %d trades loaded", symbol, len(trades))
 	}
 
@@ -477,12 +379,18 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 	orderStore.BindStream(session.UserDataStream)
 	session.orderStores[symbol] = orderStore
 
-	marketDataStore := NewMarketDataStore(symbol)
-	marketDataStore.BindStream(session.MarketDataStream)
-	session.marketDataStores[symbol] = marketDataStore
+	if _, ok := session.marketDataStores[symbol]; !ok {
+		marketDataStore := NewMarketDataStore(symbol)
+		marketDataStore.BindStream(session.MarketDataStream)
+		session.marketDataStores[symbol] = marketDataStore
+	}
 
-	standardIndicatorSet := NewStandardIndicatorSet(symbol, marketDataStore)
-	session.standardIndicatorSets[symbol] = standardIndicatorSet
+	marketDataStore := session.marketDataStores[symbol]
+
+	if _, ok := session.standardIndicatorSets[symbol]; !ok {
+		standardIndicatorSet := NewStandardIndicatorSet(symbol, session.MarketDataStream, marketDataStore)
+		session.standardIndicatorSets[symbol] = standardIndicatorSet
+	}
 
 	// used kline intervals by the given symbol
 	var klineSubscriptions = map[types.Interval]struct{}{}
@@ -512,29 +420,34 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 	for interval := range klineSubscriptions {
 		// avoid querying the last unclosed kline
 		endTime := environ.startTime
-		kLines, err := session.Exchange.QueryKLines(ctx, symbol, interval, types.KLineQueryOptions{
-			EndTime: &endTime,
-			Limit:   1000, // indicators need at least 100
-		})
-		if err != nil {
-			return err
-		}
+		var i int64
+		for i = 0; i < KLinePreloadLimit; i += 1000 {
+			var duration time.Duration = time.Duration(-i * int64(interval.Duration()))
+			e := endTime.Add(duration)
 
-		if len(kLines) == 0 {
-			log.Warnf("no kline data for %s %s (end time <= %s)", symbol, interval, environ.startTime)
-			continue
-		}
+			kLines, err := session.Exchange.QueryKLines(ctx, symbol, interval, types.KLineQueryOptions{
+				EndTime: &e,
+				Limit:   1000, // indicators need at least 100
+			})
+			if err != nil {
+				return err
+			}
 
-		// update last prices by the given kline
-		lastKLine := kLines[len(kLines)-1]
-		if interval == types.Interval1m {
-			log.Infof("last kline %+v", lastKLine)
-			session.lastPrices[symbol] = lastKLine.Close
-		}
+			if len(kLines) == 0 {
+				log.Warnf("no kline data for %s %s (end time <= %s)", symbol, interval, e)
+				continue
+			}
 
-		for _, k := range kLines {
-			// let market data store trigger the update, so that the indicator could be updated too.
-			marketDataStore.AddKLine(k)
+			// update last prices by the given kline
+			lastKLine := kLines[len(kLines)-1]
+			if interval == types.Interval1m {
+				session.lastPrices[symbol] = lastKLine.Close
+			}
+
+			for _, k := range kLines {
+				// let market data store trigger the update, so that the indicator could be updated too.
+				marketDataStore.AddKLine(k)
+			}
 		}
 	}
 
@@ -544,9 +457,16 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 	return nil
 }
 
-func (session *ExchangeSession) StandardIndicatorSet(symbol string) (*StandardIndicatorSet, bool) {
+func (session *ExchangeSession) StandardIndicatorSet(symbol string) *StandardIndicatorSet {
 	set, ok := session.standardIndicatorSets[symbol]
-	return set, ok
+	if ok {
+		return set
+	}
+
+	store, _ := session.MarketDataStore(symbol)
+	set = NewStandardIndicatorSet(symbol, session.MarketDataStream, store)
+	session.standardIndicatorSets[symbol] = set
+	return set
 }
 
 func (session *ExchangeSession) Position(symbol string) (pos *types.Position, ok bool) {
@@ -577,10 +497,38 @@ func (session *ExchangeSession) Positions() map[string]*types.Position {
 // MarketDataStore returns the market data store of a symbol
 func (session *ExchangeSession) MarketDataStore(symbol string) (s *MarketDataStore, ok bool) {
 	s, ok = session.marketDataStores[symbol]
+	if !ok {
+		s = NewMarketDataStore(symbol)
+		s.BindStream(session.MarketDataStream)
+		session.marketDataStores[symbol] = s
+		return s, true
+	}
 	return s, ok
 }
 
-// MarketDataStore returns the market data store of a symbol
+// KLine updates will be received in the order listend in intervals array
+func (session *ExchangeSession) SerialMarketDataStore(symbol string, intervals []types.Interval) (store *SerialMarketDataStore, ok bool) {
+	st, ok := session.MarketDataStore(symbol)
+	if !ok {
+		return nil, false
+	}
+	store = NewSerialMarketDataStore(symbol)
+	klines, ok := st.KLinesOfInterval(types.Interval1m)
+	if !ok {
+		log.Errorf("SerialMarketDataStore: cannot get 1m history")
+		return nil, false
+	}
+	for _, interval := range intervals {
+		store.Subscribe(interval)
+	}
+	for _, kline := range *klines {
+		store.AddKLine(kline)
+	}
+	store.BindStream(session.MarketDataStream)
+	return store, true
+}
+
+// OrderBook returns the personal orderbook of a symbol
 func (session *ExchangeSession) OrderBook(symbol string) (s *types.StreamOrderBook, ok bool) {
 	s, ok = session.orderBooks[symbol]
 	return s, ok
@@ -594,6 +542,10 @@ func (session *ExchangeSession) StartPrice(symbol string) (price fixedpoint.Valu
 func (session *ExchangeSession) LastPrice(symbol string) (price fixedpoint.Value, ok bool) {
 	price, ok = session.lastPrices[symbol]
 	return price, ok
+}
+
+func (session *ExchangeSession) AllLastPrices() map[string]fixedpoint.Value {
+	return session.lastPrices
 }
 
 func (session *ExchangeSession) LastPrices() map[string]fixedpoint.Value {
@@ -646,21 +598,19 @@ func (session *ExchangeSession) FormatOrder(order types.SubmitOrder) (types.Subm
 	return order, nil
 }
 
-func (session *ExchangeSession) UpdatePrices(ctx context.Context) (err error) {
-	if session.lastPriceUpdatedAt.After(time.Now().Add(-time.Hour)) {
-		return nil
-	}
-
-	balances := session.GetAccount().Balances()
+func (session *ExchangeSession) UpdatePrices(ctx context.Context, currencies []string, fiat string) (err error) {
+	// TODO: move this cache check to the http routes
+	// if session.lastPriceUpdatedAt.After(time.Now().Add(-time.Hour)) {
+	// 	return nil
+	// }
 
 	var symbols []string
-	for _, b := range balances {
-		symbols = append(symbols, b.Currency+"USDT")
-		symbols = append(symbols, "USDT"+b.Currency)
+	for _, c := range currencies {
+		symbols = append(symbols, c+fiat) // BTC/USDT
+		symbols = append(symbols, fiat+c) // USDT/TWD
 	}
 
 	tickers, err := session.Exchange.QueryTickers(ctx, symbols...)
-
 	if err != nil || len(tickers) == 0 {
 		return err
 	}
@@ -668,12 +618,7 @@ func (session *ExchangeSession) UpdatePrices(ctx context.Context) (err error) {
 	var lastTime time.Time
 	for k, v := range tickers {
 		// for {Crypto}/USDT markets
-		if strings.HasSuffix(k, "USDT") {
-			session.lastPrices[k] = v.Last
-		} else if strings.HasPrefix(k, "USDT") {
-			session.lastPrices[k] = fixedpoint.One.Div(v.Last)
-		}
-
+		session.lastPrices[k] = v.Last
 		if v.Time.After(lastTime) {
 			lastTime = v.Time
 		}
@@ -727,17 +672,17 @@ func (session *ExchangeSession) FindPossibleSymbols() (symbols []string, err err
 // InitExchange initialize the exchange instance and allocate memory for fields
 // In this stage, the session var could be loaded from the JSON config, so the pointer fields are still nil
 // The Init method will be called after this stage, environment.Init will call the session.Init method later.
-func (session *ExchangeSession) InitExchange(name string, exchange types.Exchange) error {
+func (session *ExchangeSession) InitExchange(name string, ex types.Exchange) error {
 	var err error
 	var exchangeName = session.ExchangeName
-	if exchange == nil {
+	if ex == nil {
 		if session.PublicOnly {
-			exchange, err = cmdutil.NewExchangePublic(exchangeName)
+			ex, err = exchange2.NewPublic(exchangeName)
 		} else {
 			if session.Key != "" && session.Secret != "" {
-				exchange, err = cmdutil.NewExchangeStandard(exchangeName, session.Key, session.Secret, session.Passphrase, session.SubAccount)
+				ex, err = exchange2.NewStandard(exchangeName, session.Key, session.Secret, session.Passphrase, session.SubAccount)
 			} else {
-				exchange, err = cmdutil.NewExchangeWithEnvVarPrefix(exchangeName, session.EnvVarPrefix)
+				ex, err = exchange2.NewWithEnvVarPrefix(exchangeName, session.EnvVarPrefix)
 			}
 		}
 	}
@@ -748,7 +693,7 @@ func (session *ExchangeSession) InitExchange(name string, exchange types.Exchang
 
 	// configure exchange
 	if session.Margin {
-		marginExchange, ok := exchange.(types.MarginExchange)
+		marginExchange, ok := ex.(types.MarginExchange)
 		if !ok {
 			return fmt.Errorf("exchange %s does not support margin", exchangeName)
 		}
@@ -761,7 +706,7 @@ func (session *ExchangeSession) InitExchange(name string, exchange types.Exchang
 	}
 
 	if session.Futures {
-		futuresExchange, ok := exchange.(types.FuturesExchange)
+		futuresExchange, ok := ex.(types.FuturesExchange)
 		if !ok {
 			return fmt.Errorf("exchange %s does not support futures", exchangeName)
 		}
@@ -774,14 +719,9 @@ func (session *ExchangeSession) InitExchange(name string, exchange types.Exchang
 	}
 
 	session.Name = name
-	session.Notifiability = Notifiability{
-		SymbolChannelRouter:  NewPatternChannelRouter(nil),
-		SessionChannelRouter: NewPatternChannelRouter(nil),
-		ObjectChannelRouter:  NewObjectChannelRouter(),
-	}
-	session.Exchange = exchange
-	session.UserDataStream = exchange.NewStream()
-	session.MarketDataStream = exchange.NewStream()
+	session.Exchange = ex
+	session.UserDataStream = ex.NewStream()
+	session.MarketDataStream = ex.NewStream()
 	session.MarketDataStream.SetPublicOnly()
 
 	// pointer fields
@@ -799,8 +739,7 @@ func (session *ExchangeSession) InitExchange(name string, exchange types.Exchang
 	session.orderStores = make(map[string]*OrderStore)
 	session.OrderExecutor = &ExchangeOrderExecutor{
 		// copy the notification system so that we can route
-		Notifiability: session.Notifiability,
-		Session:       session,
+		Session: session,
 	}
 
 	session.usedSymbols = make(map[string]struct{})
@@ -923,9 +862,34 @@ func (session *ExchangeSession) bindUserDataStreamMetrics(stream types.Stream) {
 
 func (session *ExchangeSession) bindConnectionStatusNotification(stream types.Stream, streamName string) {
 	stream.OnDisconnect(func() {
-		session.Notifiability.Notify("session %s %s stream disconnected", session.Name, streamName)
+		Notify("session %s %s stream disconnected", session.Name, streamName)
 	})
 	stream.OnConnect(func() {
-		session.Notifiability.Notify("session %s %s stream connected", session.Name, streamName)
+		Notify("session %s %s stream connected", session.Name, streamName)
 	})
+}
+
+func (session *ExchangeSession) SlackAttachment() slack.Attachment {
+	var fields []slack.AttachmentField
+	var footerIcon = types.ExchangeFooterIcon(session.ExchangeName)
+	return slack.Attachment{
+		// Pretext:       "",
+		// Text:  text,
+		Title:      session.Name,
+		Fields:     fields,
+		FooterIcon: footerIcon,
+		Footer:     templateutil.Render("update time {{ . }}", time.Now().Format(time.RFC822)),
+	}
+}
+
+func (session *ExchangeSession) FormatOrders(orders []types.SubmitOrder) (formattedOrders []types.SubmitOrder, err error) {
+	for _, order := range orders {
+		o, err := session.FormatOrder(order)
+		if err != nil {
+			return formattedOrders, err
+		}
+		formattedOrders = append(formattedOrders, o)
+	}
+
+	return formattedOrders, err
 }

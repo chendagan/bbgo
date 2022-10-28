@@ -2,6 +2,7 @@ package max
 
 //go:generate -command GetRequest requestgen -method GET
 //go:generate -command PostRequest requestgen -method POST
+//go:generate -command DeleteRequest requestgen -method DELETE
 
 import (
 	"github.com/c9s/requestgen"
@@ -10,25 +11,25 @@ import (
 )
 
 type AccountService struct {
-	client *RestClient
+	client requestgen.AuthenticatedAPIClient
 }
 
 // Account is for max rest api v2, Balance and Type will be conflict with types.PrivateBalanceUpdate
 type Account struct {
-	Currency     string           `json:"currency"`
-	Balance      fixedpoint.Value `json:"balance"`
-	Locked       fixedpoint.Value `json:"locked"`
-	Type         string           `json:"type"`
+	Type     string           `json:"type"`
+	Currency string           `json:"currency"`
+	Balance  fixedpoint.Value `json:"balance"`
+	Locked   fixedpoint.Value `json:"locked"`
+
+	// v3 fields for M wallet
+	Debt      fixedpoint.Value `json:"debt"`
+	Principal fixedpoint.Value `json:"principal"`
+	Borrowed  fixedpoint.Value `json:"borrowed"`
+	Interest  fixedpoint.Value `json:"interest"`
+
+	// v2 fields
 	FiatCurrency string           `json:"fiat_currency"`
 	FiatBalance  fixedpoint.Value `json:"fiat_balance"`
-}
-
-// Balance is for kingfisher
-type Balance struct {
-	Currency  string
-	Available int64
-	Locked    int64
-	Total     int64
 }
 
 type UserBank struct {
@@ -100,16 +101,6 @@ type GetAccountsRequest struct {
 
 func (s *AccountService) NewGetAccountsRequest() *GetAccountsRequest {
 	return &GetAccountsRequest{client: s.client}
-}
-
-//go:generate GetRequest -url "v2/members/me" -type GetMeRequest -responseType .UserInfo
-type GetMeRequest struct {
-	client requestgen.AuthenticatedAPIClient
-}
-
-// NewGetMeRequest returns the current user info by the current used MAX key and secret
-func (s *AccountService) NewGetMeRequest() *GetMeRequest {
-	return &GetMeRequest{client: s.client}
 }
 
 type Deposit struct {

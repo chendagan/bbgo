@@ -9,17 +9,17 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/c9s/bbgo/pkg/bbgo"
-	"github.com/c9s/bbgo/pkg/exchange/max"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/service"
 	"github.com/c9s/bbgo/pkg/types"
+	"github.com/c9s/bbgo/pkg/util"
 )
 
 const ID = "grid"
 
 var log = logrus.WithField("strategy", ID)
 
-var NotionalModifier = fixedpoint.NewFromFloat(1.0001)
+var notionalModifier = fixedpoint.NewFromFloat(1.0001)
 
 func init() {
 	// Register the pointer of the strategy struct,
@@ -40,19 +40,9 @@ type State struct {
 	// any created orders for tracking trades
 	// [source Order ID] -> arbitrage order
 	ArbitrageOrders map[uint64]types.Order `json:"arbitrageOrders"`
-
-	ProfitStats types.ProfitStats `json:"profitStats,omitempty"`
 }
 
 type Strategy struct {
-	// The notification system will be injected into the strategy automatically.
-	// This field will be injected automatically since it's a single exchange strategy.
-	*bbgo.Notifiability `json:"-" yaml:"-"`
-
-	*bbgo.Graceful `json:"-" yaml:"-"`
-
-	*bbgo.Persistence
-
 	// OrderExecutor is an interface for submitting order.
 	// This field will be injected automatically since it's a single exchange strategy.
 	bbgo.OrderExecutor `json:"-" yaml:"-"`
@@ -94,13 +84,15 @@ type Strategy struct {
 	// Long means you want to hold more base asset than the quote asset.
 	Long bool `json:"long,omitempty" yaml:"long,omitempty"`
 
-	state *State
+	State *State `persistence:"state"`
+
+	ProfitStats *types.ProfitStats `persistence:"profit_stats"`
 
 	// orderStore is used to store all the created orders, so that we can filter the trades.
 	orderStore *bbgo.OrderStore
 
 	// activeOrders is the locally maintained active order book of the maker orders.
-	activeOrders *bbgo.LocalActiveOrderBook
+	activeOrders *bbgo.ActiveOrderBook
 
 	tradeCollector *bbgo.TradeCollector
 
@@ -205,7 +197,7 @@ func (s *Strategy) generateGridSellOrders(session *bbgo.ExchangeSession) ([]type
 				baseBalance.Available.String())
 		}
 
-		if _, filled := s.state.FilledSellGrids[price]; filled {
+		if _, filled := s.State.FilledSellGrids[price]; filled {
 			log.Debugf("sell grid at price %s is already filled, skipping", price.String())
 			continue
 		}
@@ -222,7 +214,7 @@ func (s *Strategy) generateGridSellOrders(session *bbgo.ExchangeSession) ([]type
 		})
 		baseBalance.Available = baseBalance.Available.Sub(quantity)
 
-		s.state.FilledSellGrids[price] = struct{}{}
+		s.State.FilledSellGrids[price] = struct{}{}
 	}
 
 	return orders, nil
@@ -306,7 +298,7 @@ func (s *Strategy) generateGridBuyOrders(session *bbgo.ExchangeSession) ([]types
 				quoteQuantity)
 		}
 
-		if _, filled := s.state.FilledBuyGrids[price]; filled {
+		if _, filled := s.State.FilledBuyGrids[price]; filled {
 			log.Debugf("buy grid at price %v is already filled, skipping", price)
 			continue
 		}
@@ -323,7 +315,7 @@ func (s *Strategy) generateGridBuyOrders(session *bbgo.ExchangeSession) ([]types
 		})
 		balance.Available = balance.Available.Sub(quoteQuantity)
 
-		s.state.FilledBuyGrids[price] = struct{}{}
+		s.State.FilledBuyGrids[price] = struct{}{}
 	}
 
 	return orders, nil
@@ -422,7 +414,7 @@ func (s *Strategy) handleFilledOrder(filledOrder types.Order) {
 
 	if amount.Compare(s.Market.MinNotional) <= 0 {
 		quantity = bbgo.AdjustFloatQuantityByMinAmount(
-			quantity, price, s.Market.MinNotional.Mul(NotionalModifier))
+			quantity, price, s.Market.MinNotional.Mul(notionalModifier))
 
 		// update amount
 		amount = quantity.Mul(price)
@@ -444,7 +436,7 @@ func (s *Strategy) handleFilledOrder(filledOrder types.Order) {
 
 	// create one-way link from the newly created orders
 	for _, o := range createdOrders {
-		s.state.ArbitrageOrders[o.OrderID] = filledOrder
+		s.State.ArbitrageOrders[o.OrderID] = filledOrder
 	}
 
 	s.orderStore.Add(createdOrders...)
@@ -460,53 +452,53 @@ func (s *Strategy) handleFilledOrder(filledOrder types.Order) {
 	if s.Long {
 		switch filledOrder.Side {
 		case types.SideTypeSell:
-			if buyOrder, ok := s.state.ArbitrageOrders[filledOrder.OrderID]; ok {
+			if buyOrder, ok := s.State.ArbitrageOrders[filledOrder.OrderID]; ok {
 				// use base asset quantity here
 				baseProfit := buyOrder.Quantity.Sub(filledOrder.Quantity)
-				s.state.AccumulativeArbitrageProfit = s.state.AccumulativeArbitrageProfit.
+				s.State.AccumulativeArbitrageProfit = s.State.AccumulativeArbitrageProfit.
 					Add(baseProfit)
-				s.Notify("%s grid arbitrage profit %v %s, accumulative arbitrage profit %v %s",
+				bbgo.Notify("%s grid arbitrage profit %v %s, accumulative arbitrage profit %v %s",
 					s.Symbol,
 					baseProfit, s.Market.BaseCurrency,
-					s.state.AccumulativeArbitrageProfit, s.Market.BaseCurrency,
+					s.State.AccumulativeArbitrageProfit, s.Market.BaseCurrency,
 				)
 			}
 
 		case types.SideTypeBuy:
-			if sellOrder, ok := s.state.ArbitrageOrders[filledOrder.OrderID]; ok {
+			if sellOrder, ok := s.State.ArbitrageOrders[filledOrder.OrderID]; ok {
 				// use base asset quantity here
 				baseProfit := filledOrder.Quantity.Sub(sellOrder.Quantity)
-				s.state.AccumulativeArbitrageProfit = s.state.AccumulativeArbitrageProfit.Add(baseProfit)
-				s.Notify("%s grid arbitrage profit %v %s, accumulative arbitrage profit %v %s",
+				s.State.AccumulativeArbitrageProfit = s.State.AccumulativeArbitrageProfit.Add(baseProfit)
+				bbgo.Notify("%s grid arbitrage profit %v %s, accumulative arbitrage profit %v %s",
 					s.Symbol,
 					baseProfit, s.Market.BaseCurrency,
-					s.state.AccumulativeArbitrageProfit, s.Market.BaseCurrency,
+					s.State.AccumulativeArbitrageProfit, s.Market.BaseCurrency,
 				)
 			}
 		}
 	} else if !s.Long && s.Quantity.Sign() > 0 {
 		switch filledOrder.Side {
 		case types.SideTypeSell:
-			if buyOrder, ok := s.state.ArbitrageOrders[filledOrder.OrderID]; ok {
+			if buyOrder, ok := s.State.ArbitrageOrders[filledOrder.OrderID]; ok {
 				// use base asset quantity here
 				quoteProfit := filledOrder.Quantity.Mul(filledOrder.Price).Sub(
 					buyOrder.Quantity.Mul(buyOrder.Price))
-				s.state.AccumulativeArbitrageProfit = s.state.AccumulativeArbitrageProfit.Add(quoteProfit)
-				s.Notify("%s grid arbitrage profit %v %s, accumulative arbitrage profit %v %s",
+				s.State.AccumulativeArbitrageProfit = s.State.AccumulativeArbitrageProfit.Add(quoteProfit)
+				bbgo.Notify("%s grid arbitrage profit %v %s, accumulative arbitrage profit %v %s",
 					s.Symbol,
 					quoteProfit, s.Market.QuoteCurrency,
-					s.state.AccumulativeArbitrageProfit, s.Market.QuoteCurrency,
+					s.State.AccumulativeArbitrageProfit, s.Market.QuoteCurrency,
 				)
 			}
 		case types.SideTypeBuy:
-			if sellOrder, ok := s.state.ArbitrageOrders[filledOrder.OrderID]; ok {
+			if sellOrder, ok := s.State.ArbitrageOrders[filledOrder.OrderID]; ok {
 				// use base asset quantity here
 				quoteProfit := sellOrder.Quantity.Mul(sellOrder.Price).
 					Sub(filledOrder.Quantity.Mul(filledOrder.Price))
-				s.state.AccumulativeArbitrageProfit = s.state.AccumulativeArbitrageProfit.Add(quoteProfit)
-				s.Notify("%s grid arbitrage profit %v %s, accumulative arbitrage profit %v %s", s.Symbol,
+				s.State.AccumulativeArbitrageProfit = s.State.AccumulativeArbitrageProfit.Add(quoteProfit)
+				bbgo.Notify("%s grid arbitrage profit %v %s, accumulative arbitrage profit %v %s", s.Symbol,
 					quoteProfit, s.Market.QuoteCurrency,
-					s.state.AccumulativeArbitrageProfit, s.Market.QuoteCurrency,
+					s.State.AccumulativeArbitrageProfit, s.Market.QuoteCurrency,
 				)
 			}
 		}
@@ -518,55 +510,26 @@ func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 }
 
 func (s *Strategy) LoadState() error {
-	instanceID := s.InstanceID()
-
-	var state State
-	if s.Persistence != nil {
-		if err := s.Persistence.Load(&state, ID, instanceID); err != nil {
-			if err != service.ErrPersistenceNotExists {
-				return errors.Wrapf(err, "state load error")
-			}
-
-			s.state = &State{
-				FilledBuyGrids:  make(map[fixedpoint.Value]struct{}),
-				FilledSellGrids: make(map[fixedpoint.Value]struct{}),
-				ArbitrageOrders: make(map[uint64]types.Order),
-				Position:        types.NewPositionFromMarket(s.Market),
-			}
-		} else {
-			s.state = &state
+	if s.State == nil {
+		s.State = &State{
+			FilledBuyGrids:  make(map[fixedpoint.Value]struct{}),
+			FilledSellGrids: make(map[fixedpoint.Value]struct{}),
+			ArbitrageOrders: make(map[uint64]types.Order),
+			Position:        types.NewPositionFromMarket(s.Market),
 		}
 	}
-
-	// init profit stats
-	s.state.ProfitStats.Init(s.Market)
 
 	// field guards
-	if s.state.ArbitrageOrders == nil {
-		s.state.ArbitrageOrders = make(map[uint64]types.Order)
+	if s.State.ArbitrageOrders == nil {
+		s.State.ArbitrageOrders = make(map[uint64]types.Order)
 	}
-	if s.state.FilledBuyGrids == nil {
-		s.state.FilledBuyGrids = make(map[fixedpoint.Value]struct{})
+	if s.State.FilledBuyGrids == nil {
+		s.State.FilledBuyGrids = make(map[fixedpoint.Value]struct{})
 	}
-	if s.state.FilledSellGrids == nil {
-		s.state.FilledSellGrids = make(map[fixedpoint.Value]struct{})
+	if s.State.FilledSellGrids == nil {
+		s.State.FilledSellGrids = make(map[fixedpoint.Value]struct{})
 	}
 
-	return nil
-}
-
-func (s *Strategy) SaveState() error {
-	if s.Persistence != nil {
-		log.Infof("backing up grid state...")
-
-		instanceID := s.InstanceID()
-		submitOrders := s.activeOrders.Backup()
-		s.state.Orders = submitOrders
-
-		if err := s.Persistence.Save(s.state, ID, instanceID); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -586,28 +549,32 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	}
 
 	instanceID := s.InstanceID()
-	s.groupID = max.GenerateGroupID(instanceID)
+	s.groupID = util.FNV32(instanceID)
 	log.Infof("using group id %d from fnv(%s)", s.groupID, instanceID)
+
+	if s.ProfitStats == nil {
+		s.ProfitStats = types.NewProfitStats(s.Market)
+	}
 
 	if err := s.LoadState(); err != nil {
 		return err
 	}
 
-	s.Notify("grid %s position", s.Symbol, s.state.Position)
+	bbgo.Notify("grid %s position", s.Symbol, s.State.Position)
 
 	s.orderStore = bbgo.NewOrderStore(s.Symbol)
 	s.orderStore.BindStream(session.UserDataStream)
 
 	// we don't persist orders so that we can not clear the previous orders for now. just need time to support this.
-	s.activeOrders = bbgo.NewLocalActiveOrderBook(s.Symbol)
+	s.activeOrders = bbgo.NewActiveOrderBook(s.Symbol)
 	s.activeOrders.OnFilled(s.handleFilledOrder)
 	s.activeOrders.BindStream(session.UserDataStream)
 
-	s.tradeCollector = bbgo.NewTradeCollector(s.Symbol, s.state.Position, s.orderStore)
+	s.tradeCollector = bbgo.NewTradeCollector(s.Symbol, s.State.Position, s.orderStore)
 
 	s.tradeCollector.OnTrade(func(trade types.Trade, profit, netProfit fixedpoint.Value) {
-		s.Notifiability.Notify(trade)
-		s.state.ProfitStats.AddTrade(trade)
+		bbgo.Notify(trade)
+		s.ProfitStats.AddTrade(trade)
 	})
 
 	/*
@@ -621,18 +588,16 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	*/
 
 	s.tradeCollector.OnPositionUpdate(func(position *types.Position) {
-		s.Notifiability.Notify(position)
+		bbgo.Notify(position)
 	})
 	s.tradeCollector.BindStream(session.UserDataStream)
 
-	s.Graceful.OnShutdown(func(ctx context.Context, wg *sync.WaitGroup) {
+	bbgo.OnShutdown(ctx, func(ctx context.Context, wg *sync.WaitGroup) {
 		defer wg.Done()
 
-		if err := s.SaveState(); err != nil {
-			log.WithError(err).Errorf("can not save state: %+v", s.state)
-		} else {
-			s.Notify("%s: %s grid is saved", ID, s.Symbol)
-		}
+		submitOrders := s.activeOrders.Backup()
+		s.State.Orders = submitOrders
+		bbgo.Sync(ctx, s)
 
 		// now we can cancel the open orders
 		log.Infof("canceling active orders...")
@@ -643,10 +608,10 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	session.UserDataStream.OnStart(func() {
 		// if we have orders in the state data, we can restore them
-		if len(s.state.Orders) > 0 {
-			s.Notifiability.Notify("restoring %s %d grid orders...", s.Symbol, len(s.state.Orders))
+		if len(s.State.Orders) > 0 {
+			bbgo.Notify("restoring %s %d grid orders...", s.Symbol, len(s.State.Orders))
 
-			createdOrders, err := orderExecutor.SubmitOrders(ctx, s.state.Orders...)
+			createdOrders, err := orderExecutor.SubmitOrders(ctx, s.State.Orders...)
 			if err != nil {
 				log.WithError(err).Error("active orders restore error")
 			}

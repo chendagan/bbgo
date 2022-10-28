@@ -7,11 +7,13 @@ import (
 	"io/ioutil"
 	"reflect"
 	"runtime"
+	"strings"
 
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v3"
 
 	"github.com/c9s/bbgo/pkg/datatype"
+	"github.com/c9s/bbgo/pkg/dynamic"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/service"
 	"github.com/c9s/bbgo/pkg/types"
@@ -74,15 +76,17 @@ type TelegramNotification struct {
 	Broadcast bool `json:"broadcast" yaml:"broadcast"`
 }
 
+type NotificationSwitches struct {
+	Trade       bool `json:"trade" yaml:"trade"`
+	Position    bool `json:"position" yaml:"position"`
+	OrderUpdate bool `json:"orderUpdate" yaml:"orderUpdate"`
+	SubmitOrder bool `json:"submitOrder" yaml:"submitOrder"`
+}
+
 type NotificationConfig struct {
-	Slack *SlackNotification `json:"slack,omitempty" yaml:"slack,omitempty"`
-
+	Slack    *SlackNotification    `json:"slack,omitempty" yaml:"slack,omitempty"`
 	Telegram *TelegramNotification `json:"telegram,omitempty" yaml:"telegram,omitempty"`
-
-	SymbolChannels  map[string]string `json:"symbolChannels,omitempty" yaml:"symbolChannels,omitempty"`
-	SessionChannels map[string]string `json:"sessionChannels,omitempty" yaml:"sessionChannels,omitempty"`
-
-	Routing *SlackNotificationRouting `json:"routing,omitempty" yaml:"routing,omitempty"`
+	Switches *NotificationSwitches `json:"switches" yaml:"switches"`
 }
 
 type Session struct {
@@ -99,23 +103,73 @@ type Session struct {
 	IsolatedMarginSymbol string `json:"isolatedMarginSymbol,omitempty" yaml:"isolatedMarginSymbol,omitempty"`
 }
 
+//go:generate go run github.com/dmarkham/enumer -type=BacktestFeeMode -transform=snake -trimprefix BacktestFeeMode -yaml -json
+type BacktestFeeMode int
+
+const (
+	// BackTestFeeModeQuoteFee is designed for clean position but which also counts the fee in the quote balance.
+	// buy order = quote currency fee
+	// sell order = quote currency fee
+	BacktestFeeModeQuote BacktestFeeMode = iota // quote
+
+	// BackTestFeeModeNativeFee is the default crypto exchange fee mode.
+	// buy order = base currency fee
+	// sell order = quote currency fee
+	BacktestFeeModeNative // BackTestFeeMode = "native"
+
+	// BackTestFeeModeFeeToken is the mode which calculates fee from the outside of the balances.
+	// the fee will not be included in the balances nor the profit.
+	BacktestFeeModeToken // BackTestFeeMode = "token"
+)
+
 type Backtest struct {
 	StartTime types.LooseFormatTime  `json:"startTime,omitempty" yaml:"startTime,omitempty"`
 	EndTime   *types.LooseFormatTime `json:"endTime,omitempty" yaml:"endTime,omitempty"`
 
 	// RecordTrades is an option, if set to true, back-testing should record the trades into database
-	RecordTrades bool                       `json:"recordTrades,omitempty" yaml:"recordTrades,omitempty"`
-	Account      map[string]BacktestAccount `json:"account" yaml:"account"`
-	Symbols      []string                   `json:"symbols" yaml:"symbols"`
-	Sessions     []string                   `json:"sessions" yaml:"sessions"`
+	RecordTrades bool `json:"recordTrades,omitempty" yaml:"recordTrades,omitempty"`
+
+	// Deprecated:
+	// Account is deprecated, use Accounts instead
+	Account map[string]BacktestAccount `json:"account" yaml:"account"`
+
+	FeeMode BacktestFeeMode `json:"feeMode" yaml:"feeMode"`
+
+	Accounts map[string]BacktestAccount `json:"accounts" yaml:"accounts"`
+	Symbols  []string                   `json:"symbols" yaml:"symbols"`
+	Sessions []string                   `json:"sessions" yaml:"sessions"`
+
+	// sync 1 second interval KLines
+	SyncSecKLines bool `json:"syncSecKLines,omitempty" yaml:"syncSecKLines,omitempty"`
+}
+
+func (b *Backtest) GetAccount(n string) BacktestAccount {
+	accountConfig, ok := b.Accounts[n]
+	if ok {
+		return accountConfig
+	}
+
+	accountConfig, ok = b.Account[n]
+	if ok {
+		return accountConfig
+	}
+
+	return DefaultBacktestAccount
 }
 
 type BacktestAccount struct {
-	// TODO: MakerFeeRate should replace the commission fields
 	MakerFeeRate fixedpoint.Value `json:"makerFeeRate,omitempty" yaml:"makerFeeRate,omitempty"`
 	TakerFeeRate fixedpoint.Value `json:"takerFeeRate,omitempty" yaml:"takerFeeRate,omitempty"`
 
 	Balances BacktestAccountBalanceMap `json:"balances" yaml:"balances"`
+}
+
+var DefaultBacktestAccount = BacktestAccount{
+	MakerFeeRate: fixedpoint.MustNewFromString("0.050%"),
+	TakerFeeRate: fixedpoint.MustNewFromString("0.075%"),
+	Balances: BacktestAccountBalanceMap{
+		"USDT": fixedpoint.NewFromFloat(10000),
+	},
 }
 
 type BA BacktestAccount
@@ -180,21 +234,68 @@ func GetNativeBuildTargetConfig() BuildTargetConfig {
 	}
 }
 
+type SyncSymbol struct {
+	Symbol  string `json:"symbol" yaml:"symbol"`
+	Session string `json:"session" yaml:"session"`
+}
+
+func (ss *SyncSymbol) UnmarshalYAML(unmarshal func(a interface{}) error) (err error) {
+	var s string
+	if err = unmarshal(&s); err == nil {
+		aa := strings.SplitN(s, ":", 2)
+		if len(aa) > 1 {
+			ss.Session = aa[0]
+			ss.Symbol = aa[1]
+		} else {
+			ss.Symbol = aa[0]
+		}
+		return nil
+	}
+
+	type localSyncSymbol SyncSymbol
+	var ssNew localSyncSymbol
+	if err = unmarshal(&ssNew); err == nil {
+		*ss = SyncSymbol(ssNew)
+		return nil
+	}
+
+	return err
+}
+
+func categorizeSyncSymbol(slice []SyncSymbol) (map[string][]string, []string) {
+	var rest []string
+	var m = make(map[string][]string)
+	for _, ss := range slice {
+		if len(ss.Session) > 0 {
+			m[ss.Session] = append(m[ss.Session], ss.Symbol)
+		} else {
+			rest = append(rest, ss.Symbol)
+		}
+	}
+	return m, rest
+}
+
 type SyncConfig struct {
 	// Sessions to sync, if ignored, all defined sessions will sync
 	Sessions []string `json:"sessions,omitempty" yaml:"sessions,omitempty"`
 
-	// Symbols is the list of symbol to sync, if ignored, symbols wlll be discovered by your existing crypto balances
-	Symbols []string `json:"symbols,omitempty" yaml:"symbols,omitempty"`
+	// Symbols is the list of session:symbol pair to sync, if ignored, symbols wlll be discovered by your existing crypto balances
+	// Valid formats are: {session}:{symbol},  {symbol} or in YAML object form {symbol: "BTCUSDT", session:"max" }
+	Symbols []SyncSymbol `json:"symbols,omitempty" yaml:"symbols,omitempty"`
 
-	// DepositHistory for syncing deposit history
+	// DepositHistory is for syncing deposit history
 	DepositHistory bool `json:"depositHistory" yaml:"depositHistory"`
 
-	// WithdrawHistory for syncing withdraw history
+	// WithdrawHistory is for syncing withdraw history
 	WithdrawHistory bool `json:"withdrawHistory" yaml:"withdrawHistory"`
 
-	// RewardHistory for syncing reward history
+	// RewardHistory is for syncing reward history
 	RewardHistory bool `json:"rewardHistory" yaml:"rewardHistory"`
+
+	// MarginHistory is for syncing margin related history: loans, repays, interests and liquidations
+	MarginHistory bool `json:"marginHistory" yaml:"marginHistory"`
+
+	MarginAssets []string `json:"marginAssets" yaml:"marginAssets"`
 
 	// Since is the date where you want to start syncing data
 	Since *types.LooseFormatTime `json:"since,omitempty"`
@@ -296,6 +397,38 @@ func (c *Config) YAML() ([]byte, error) {
 	enc.SetIndent(2)
 	err = enc.Encode(m)
 	return buf.Bytes(), err
+}
+
+func (c *Config) GetSignature() string {
+	var s string
+
+	var ps []string
+
+	// for single exchange strategy
+	if len(c.ExchangeStrategies) == 1 && len(c.CrossExchangeStrategies) == 0 {
+		mount := c.ExchangeStrategies[0].Mounts[0]
+		ps = append(ps, mount)
+
+		strategy := c.ExchangeStrategies[0].Strategy
+
+		id := strategy.ID()
+		ps = append(ps, id)
+
+		if symbol, ok := dynamic.LookupSymbolField(reflect.ValueOf(strategy)); ok {
+			ps = append(ps, symbol)
+		}
+	}
+
+	startTime := c.Backtest.StartTime.Time()
+	ps = append(ps, startTime.Format("2006-01-02"))
+
+	if c.Backtest.EndTime != nil {
+		endTime := c.Backtest.EndTime.Time()
+		ps = append(ps, endTime.Format("2006-01-02"))
+	}
+
+	s = strings.Join(ps, "_")
+	return s
 }
 
 type Stash map[string]interface{}

@@ -3,13 +3,16 @@ notifications:
   slack:
     defaultChannel: "bbgo"
     errorChannel: "bbgo-error"
+  switches:
+    trade: true
+    orderUpdate: true
+    submitOrder: true
 
 exchangeStrategies:
   - on: max
     rebalance:
       interval: 1d
-      baseCurrency: TWD
-      ignoreLocked: true
+      quoteCurrency: TWD
       targetWeights:
         BTC: 40%
         ETH: 20%
@@ -19,5 +22,4 @@ exchangeStrategies:
       threshold: 2%
       # max amount to buy or sell per order
       maxAmount: 10_000
-      verbose: true
       dryRun: false

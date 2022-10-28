@@ -48,13 +48,6 @@ func TestLoadConfig(t *testing.T) {
 			wantErr: false,
 			f: func(t *testing.T, config *Config) {
 				assert.NotNil(t, config.Notifications)
-				assert.NotNil(t, config.Notifications.SessionChannels)
-				assert.NotNil(t, config.Notifications.SymbolChannels)
-				assert.Equal(t, map[string]string{
-					"^BTC": "#btc",
-					"^ETH": "#eth",
-				}, config.Notifications.SymbolChannels)
-				assert.NotNil(t, config.Notifications.Routing)
 				assert.Equal(t, "#dev-bbgo", config.Notifications.Slack.DefaultChannel)
 				assert.Equal(t, "#error", config.Notifications.Slack.ErrorChannel)
 			},
@@ -82,16 +75,25 @@ func TestLoadConfig(t *testing.T) {
 				assert.Equal(t, map[string]interface{}{
 					"sessions": map[string]interface{}{
 						"max": map[string]interface{}{
-							"exchange":     "max",
-							"envVarPrefix": "MAX",
-							"takerFeeRate": 0.,
-							"makerFeeRate": 0.,
+							"exchange":                "max",
+							"envVarPrefix":            "MAX",
+							"takerFeeRate":            0.,
+							"makerFeeRate":            0.,
+							"modifyOrderAmountForFee": false,
 						},
 						"binance": map[string]interface{}{
-							"exchange":     "binance",
-							"envVarPrefix": "BINANCE",
-							"takerFeeRate": 0.,
-							"makerFeeRate": 0.,
+							"exchange":                "binance",
+							"envVarPrefix":            "BINANCE",
+							"takerFeeRate":            0.,
+							"makerFeeRate":            0.,
+							"modifyOrderAmountForFee": false,
+						},
+						"ftx": map[string]interface{}{
+							"exchange":                "ftx",
+							"envVarPrefix":            "FTX",
+							"takerFeeRate":            0.,
+							"makerFeeRate":            0.,
+							"modifyOrderAmountForFee": true,
 						},
 					},
 					"build": map[string]interface{}{
@@ -214,5 +216,59 @@ func TestLoadConfig(t *testing.T) {
 			}
 		})
 	}
+}
 
+func TestSyncSymbol(t *testing.T) {
+	t.Run("symbol", func(t *testing.T) {
+		var ss []SyncSymbol
+		var err = yaml.Unmarshal([]byte(`- BTCUSDT`), &ss)
+		assert.NoError(t, err)
+		assert.Equal(t, []SyncSymbol{
+			{Symbol: "BTCUSDT"},
+		}, ss)
+	})
+
+	t.Run("session:symbol", func(t *testing.T) {
+		var ss []SyncSymbol
+		var err = yaml.Unmarshal([]byte(`- max:BTCUSDT`), &ss)
+		assert.NoError(t, err)
+		assert.Equal(t, []SyncSymbol{
+			{Session: "max", Symbol: "BTCUSDT"},
+		}, ss)
+	})
+
+	t.Run("object", func(t *testing.T) {
+		var ss []SyncSymbol
+		var err = yaml.Unmarshal([]byte(`- { session: "max", symbol: "BTCUSDT" }`), &ss)
+		assert.NoError(t, err)
+		assert.Equal(t, []SyncSymbol{
+			{Session: "max", Symbol: "BTCUSDT"},
+		}, ss)
+	})
+}
+
+func TestBackTestFeeMode(t *testing.T) {
+	var mode BacktestFeeMode
+	var err = yaml.Unmarshal([]byte(`quote`), &mode)
+	assert.NoError(t, err)
+	assert.Equal(t, BacktestFeeModeQuote, mode)
+}
+
+func Test_categorizeSyncSymbol(t *testing.T) {
+	var ss []SyncSymbol
+	var err = yaml.Unmarshal([]byte(`
+- BTCUSDT
+- ETHUSDT
+- max:MAXUSDT
+- max:USDTTWD
+- binance:BNBUSDT
+`), &ss)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, ss)
+
+	sm, rest := categorizeSyncSymbol(ss)
+	assert.NotEmpty(t, rest)
+	assert.NotEmpty(t, sm)
+	assert.Equal(t, []string{"MAXUSDT", "USDTTWD"}, sm["max"])
+	assert.Equal(t, []string{"BNBUSDT"}, sm["binance"])
 }

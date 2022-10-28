@@ -10,6 +10,7 @@ import (
 
 	"github.com/c9s/requestgen"
 
+	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
@@ -26,21 +27,24 @@ type TradeInfo struct {
 	Ask   *MarkerInfo `json:"ask,omitempty"`
 }
 
+type Liquidity string
+
 // Trade represents one returned trade on the max platform.
 type Trade struct {
-	ID                    uint64    `json:"id" db:"exchange_id"`
-	Price                 string    `json:"price" db:"price"`
-	Volume                string    `json:"volume" db:"volume"`
-	Funds                 string    `json:"funds"`
-	Market                string    `json:"market" db:"market"`
-	MarketName            string    `json:"market_name"`
-	CreatedAt             int64     `json:"created_at"`
-	CreatedAtMilliSeconds types.MillisecondTimestamp     `json:"created_at_in_ms"`
-	Side                  string    `json:"side" db:"side"`
-	OrderID               uint64    `json:"order_id"`
-	Fee                   string    `json:"fee" db:"fee"` // float number as string
-	FeeCurrency           string    `json:"fee_currency" db:"fee_currency"`
-	Info                  TradeInfo `json:"info,omitempty"`
+	ID          uint64                     `json:"id" db:"exchange_id"`
+	WalletType  WalletType                 `json:"wallet_type,omitempty"`
+	Price       fixedpoint.Value           `json:"price"`
+	Volume      fixedpoint.Value           `json:"volume"`
+	Funds       fixedpoint.Value           `json:"funds"`
+	Market      string                     `json:"market"`
+	MarketName  string                     `json:"market_name"`
+	CreatedAt   types.MillisecondTimestamp `json:"created_at"`
+	Side        string                     `json:"side"`
+	OrderID     uint64                     `json:"order_id"`
+	Fee         fixedpoint.Value           `json:"fee"` // float number as string
+	FeeCurrency string                     `json:"fee_currency"`
+	Liquidity   Liquidity                  `json:"liquidity"`
+	Info        TradeInfo                  `json:"info,omitempty"`
 }
 
 func (t Trade) IsBuyer() bool {
@@ -63,7 +67,7 @@ type QueryTradeOptions struct {
 }
 
 type TradeService struct {
-	client *RestClient
+	client requestgen.AuthenticatedAPIClient
 }
 
 func (options *QueryTradeOptions) Map() map[string]interface{} {
@@ -129,16 +133,16 @@ type PrivateRequestParams struct {
 type GetPrivateTradesRequest struct {
 	client requestgen.AuthenticatedAPIClient
 
-	market string `param:"market"`
+	market string `param:"market"` // nolint:golint,structcheck
 
 	// timestamp is the seconds elapsed since Unix epoch, set to return trades executed before the time only
-	timestamp *time.Time `param:"timestamp,seconds"`
+	timestamp *time.Time `param:"timestamp,seconds"` // nolint:golint,structcheck
 
 	// From field is a trade id, set ot return trades created after the trade
-	from *int64 `param:"from"`
+	from *int64 `param:"from"` // nolint:golint,structcheck
 
 	// To field trade id, set to return trades created before the trade
-	to *int64 `param:"to"`
+	to *int64 `param:"to"` // nolint:golint,structcheck
 
 	orderBy *string `param:"order_by"`
 
@@ -148,4 +152,3 @@ type GetPrivateTradesRequest struct {
 
 	offset *int64 `param:"offset"`
 }
-

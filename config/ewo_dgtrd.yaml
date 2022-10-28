@@ -4,47 +4,62 @@ sessions:
     exchange: binance
     futures: true
     envVarPrefix: binance
+    heikinAshi: false
 
 exchangeStrategies:
  
 - on: binance
   ewo_dgtrd:
     symbol: MATICUSDT
-    interval: 30m
+    # kline interval for indicators
+    interval: 15m
+    # use ema as MA
     useEma: false
+    # use sma as MA, used when ema is false
+    # if both sma and ema are false, use EVMA
     useSma: false
-    sigWin: 3
+    # ewo signal line window size
+    sigWin: 5
+    # SL percentage from entry price
     stoploss: 2%
+    # use HeikinAshi klines instead of normal OHLC
     useHeikinAshi: true
-    disableShortStop: true
-    #stops:
-    #- trailingStop:
-    #    callbackRate: 5.1%
-    #    closePosition: 20%
-    #    minProfit: 1%
-    #    interval: 1m
-    #    virtual: true
+    # disable SL when short
+    disableShortStop: false
+    # disable SL when long
+    disableLongStop: false
+    # CCI Stochastic Indicator high filter
+    cciStochFilterHigh: 80
+    # CCI Stochastic Indicator low filter
+    cciStochFilterLow: 20
+    # ewo change rate histogram's upperbound filter
+    # set to 1 would intend to let all ewo pass
+    ewoChangeFilterHigh: 1.
+    # ewo change rate histogram's lowerbound filter
+    # set to 0 would intend to let all ewo pass
+    ewoChangeFilterLow: 0.0
+    # print record exit point in log messages
+    record: false
 
 sync:
   userDataStream:
     trades: true
     filledOrders: true
-    since: 2020-12-01
-    sessions:
-      - binance
-    symbols:
-      - MATICUSDT
+  sessions:
+    - binance
+  symbols:
+    - MATICUSDT
 
 backtest:
-  startTime: "2022-04-14"
-  endTime: "2022-04-28"
+  startTime: "2022-05-01"
+  endTime: "2022-05-27"
   symbols:
     - MATICUSDT
   sessions: [binance]
-  account:
+  accounts:
     binance:
-      makerFeeRate: 0
-      takerFeeRate: 0
+      #makerFeeRate: 0
+      #takerFeeRate: 15
       balances:
-        MATIC: 500
-        USDT: 10000
+        MATIC: 000.0
+        USDT: 15000.0

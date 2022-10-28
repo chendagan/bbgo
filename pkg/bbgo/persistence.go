@@ -1,76 +1,116 @@
 package bbgo
 
 import (
-	"fmt"
+	"context"
+	"os"
+	"reflect"
 
+	"github.com/codingconcepts/env"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/c9s/bbgo/pkg/dynamic"
 	"github.com/c9s/bbgo/pkg/service"
 )
 
-type PersistenceSelector struct {
-	// StoreID is the store you want to use.
-	StoreID string `json:"store" yaml:"store"`
-
-	// Type is the persistence type
-	Type string `json:"type" yaml:"type"`
+var defaultPersistenceServiceFacade = &service.PersistenceServiceFacade{
+	Memory: service.NewMemoryService(),
 }
 
-// Persistence is used for strategy to inject the persistence.
-type Persistence struct {
-	PersistenceSelector *PersistenceSelector `json:"persistence,omitempty" yaml:"persistence,omitempty"`
+var persistenceServiceFacade = defaultPersistenceServiceFacade
 
-	Facade *service.PersistenceServiceFacade `json:"-" yaml:"-"`
+// Sync syncs the object properties into the persistence layer
+func Sync(ctx context.Context, obj interface{}) {
+	id := dynamic.CallID(obj)
+	if len(id) == 0 {
+		log.Warnf("InstanceID() is not provided, can not sync persistence")
+		return
+	}
+
+	isolation := GetIsolationFromContext(ctx)
+
+	ps := isolation.persistenceServiceFacade.Get()
+	err := storePersistenceFields(obj, id, ps)
+	if err != nil {
+		log.WithError(err).Errorf("persistence sync failed")
+	}
 }
 
-func (p *Persistence) backendService(t string) (service.PersistenceService, error) {
-	switch t {
-	case "json":
-		return p.Facade.Json, nil
+func loadPersistenceFields(obj interface{}, id string, persistence service.PersistenceService) error {
+	return dynamic.IterateFieldsByTag(obj, "persistence", func(tag string, field reflect.StructField, value reflect.Value) error {
+		log.Debugf("[loadPersistenceFields] loading value into field %v, tag = %s, original value = %v", field, tag, value)
 
-	case "redis":
-		if p.Facade.Redis == nil {
-			log.Warn("redis persistence is not available, fallback to memory backend")
-			return p.Facade.Memory, nil
+		newValueInf := dynamic.NewTypeValueInterface(value.Type())
+		// inf := value.Interface()
+		store := persistence.NewStore("state", id, tag)
+		if err := store.Load(&newValueInf); err != nil {
+			if err == service.ErrPersistenceNotExists {
+				log.Debugf("[loadPersistenceFields] state key does not exist, id = %v, tag = %s", id, tag)
+				return nil
+			}
+
+			return err
 		}
-		return p.Facade.Redis, nil
 
-	case "memory":
-		return p.Facade.Memory, nil
+		newValue := reflect.ValueOf(newValueInf)
+		if value.Kind() != reflect.Ptr && newValue.Kind() == reflect.Ptr {
+			newValue = newValue.Elem()
+		}
 
-	}
+		log.Debugf("[loadPersistenceFields] %v = %v -> %v\n", field, value, newValue)
 
-	return nil, fmt.Errorf("unsupported persistent type %s", t)
+		value.Set(newValue)
+		return nil
+	})
 }
 
-func (p *Persistence) Load(val interface{}, subIDs ...string) error {
-	ps, err := p.backendService(p.PersistenceSelector.Type)
+func storePersistenceFields(obj interface{}, id string, persistence service.PersistenceService) error {
+	return dynamic.IterateFieldsByTag(obj, "persistence", func(tag string, ft reflect.StructField, fv reflect.Value) error {
+		log.Debugf("[storePersistenceFields] storing value from field %v, tag = %s, original value = %v", ft, tag, fv)
+
+		inf := fv.Interface()
+		store := persistence.NewStore("state", id, tag)
+		return store.Save(inf)
+	})
+}
+
+func NewPersistenceServiceFacade(conf *PersistenceConfig) (*service.PersistenceServiceFacade, error) {
+	facade := &service.PersistenceServiceFacade{
+		Memory: service.NewMemoryService(),
+	}
+
+	if conf.Redis != nil {
+		if err := env.Set(conf.Redis); err != nil {
+			return nil, err
+		}
+
+		redisPersistence := service.NewRedisPersistenceService(conf.Redis)
+		facade.Redis = redisPersistence
+	}
+
+	if conf.Json != nil {
+		if _, err := os.Stat(conf.Json.Directory); os.IsNotExist(err) {
+			if err2 := os.MkdirAll(conf.Json.Directory, 0777); err2 != nil {
+				return nil, errors.Wrapf(err2, "can not create directory: %s", conf.Json.Directory)
+			}
+		}
+
+		jsonPersistence := &service.JsonPersistenceService{Directory: conf.Json.Directory}
+		facade.Json = jsonPersistence
+	}
+
+	return facade, nil
+}
+
+func ConfigurePersistence(ctx context.Context, conf *PersistenceConfig) error {
+	facade, err := NewPersistenceServiceFacade(conf)
 	if err != nil {
 		return err
 	}
 
-	log.Debugf("using persistence store %T for loading", ps)
+	isolation := GetIsolationFromContext(ctx)
+	isolation.persistenceServiceFacade = facade
 
-	if p.PersistenceSelector.StoreID == "" {
-		p.PersistenceSelector.StoreID = "default"
-	}
-
-	store := ps.NewStore(p.PersistenceSelector.StoreID, subIDs...)
-	return store.Load(val)
-}
-
-func (p *Persistence) Save(val interface{}, subIDs ...string) error {
-	ps, err := p.backendService(p.PersistenceSelector.Type)
-	if err != nil {
-		return err
-	}
-
-	log.Debugf("using persistence store %T for storing", ps)
-
-	if p.PersistenceSelector.StoreID == "" {
-		p.PersistenceSelector.StoreID = "default"
-	}
-
-	store := ps.NewStore(p.PersistenceSelector.StoreID, subIDs...)
-	return store.Save(val)
+	persistenceServiceFacade = facade
+	return nil
 }

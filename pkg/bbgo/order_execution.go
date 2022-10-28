@@ -6,6 +6,7 @@ import (
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+	"go.uber.org/multierr"
 
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
@@ -14,11 +15,6 @@ import (
 type OrderExecutor interface {
 	SubmitOrders(ctx context.Context, orders ...types.SubmitOrder) (createdOrders types.OrderSlice, err error)
 	CancelOrders(ctx context.Context, orders ...types.Order) error
-
-	OnTradeUpdate(cb func(trade types.Trade))
-	OnOrderUpdate(cb func(order types.Order))
-	EmitTradeUpdate(trade types.Trade)
-	EmitOrderUpdate(order types.Order)
 }
 
 type OrderExecutionRouter interface {
@@ -28,8 +24,6 @@ type OrderExecutionRouter interface {
 }
 
 type ExchangeOrderExecutionRouter struct {
-	Notifiability
-
 	sessions  map[string]*ExchangeSession
 	executors map[string]OrderExecutor
 }
@@ -44,12 +38,47 @@ func (e *ExchangeOrderExecutionRouter) SubmitOrdersTo(ctx context.Context, sessi
 		return nil, fmt.Errorf("exchange session %s not found", session)
 	}
 
-	formattedOrders, err := formatOrders(es, orders)
+	formattedOrders, err := es.FormatOrders(orders)
 	if err != nil {
 		return nil, err
 	}
 
-	return es.Exchange.SubmitOrders(ctx, formattedOrders...)
+	createdOrders, _, err := BatchPlaceOrder(ctx, es.Exchange, formattedOrders...)
+	return createdOrders, err
+}
+
+func BatchRetryPlaceOrder(ctx context.Context, exchange types.Exchange, errIdx []int, submitOrders ...types.SubmitOrder) (types.OrderSlice, error) {
+	var createdOrders types.OrderSlice
+	var err error
+	for _, idx := range errIdx {
+		createdOrder, err2 := exchange.SubmitOrder(ctx, submitOrders[idx])
+		if err2 != nil {
+			err = multierr.Append(err, err2)
+		} else if createdOrder != nil {
+			createdOrders = append(createdOrders, *createdOrder)
+		}
+	}
+
+	return createdOrders, err
+}
+
+// BatchPlaceOrder
+func BatchPlaceOrder(ctx context.Context, exchange types.Exchange, submitOrders ...types.SubmitOrder) (types.OrderSlice, []int, error) {
+	var createdOrders types.OrderSlice
+	var err error
+	var errIndexes []int
+	for i, submitOrder := range submitOrders {
+		createdOrder, err2 := exchange.SubmitOrder(ctx, submitOrder)
+		if err2 != nil {
+			err = multierr.Append(err, err2)
+			errIndexes = append(errIndexes, i)
+		} else if createdOrder != nil {
+			createdOrder.Tag = submitOrder.Tag
+			createdOrders = append(createdOrders, *createdOrder)
+		}
+	}
+
+	return createdOrders, errIndexes, err
 }
 
 func (e *ExchangeOrderExecutionRouter) CancelOrdersTo(ctx context.Context, session string, orders ...types.Order) error {
@@ -69,8 +98,6 @@ func (e *ExchangeOrderExecutionRouter) CancelOrdersTo(ctx context.Context, sessi
 type ExchangeOrderExecutor struct {
 	// MinQuoteBalance fixedpoint.Value `json:"minQuoteBalance,omitempty" yaml:"minQuoteBalance,omitempty"`
 
-	Notifiability `json:"-" yaml:"-"`
-
 	Session *ExchangeSession `json:"-" yaml:"-"`
 
 	// private trade update callbacks
@@ -80,39 +107,18 @@ type ExchangeOrderExecutor struct {
 	orderUpdateCallbacks []func(order types.Order)
 }
 
-func (e *ExchangeOrderExecutor) notifySubmitOrders(orders ...types.SubmitOrder) {
-	for _, order := range orders {
-		// pass submit order as an interface object.
-		channel, ok := e.RouteObject(&order)
-		if ok {
-			e.NotifyTo(channel, ":memo: Submitting %s %s %s order with quantity: %f @ %f", order.Symbol, order.Type, order.Side, order.Quantity, order.Price, &order)
-		} else {
-			e.Notify(":memo: Submitting %s %s %s order with quantity: %f @ %f", order.Symbol, order.Type, order.Side, order.Quantity, order.Price, &order)
-		}
-	}
-}
-
 func (e *ExchangeOrderExecutor) SubmitOrders(ctx context.Context, orders ...types.SubmitOrder) (types.OrderSlice, error) {
-	formattedOrders, err := formatOrders(e.Session, orders)
+	formattedOrders, err := e.Session.FormatOrders(orders)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, order := range formattedOrders {
-		// pass submit order as an interface object.
-		channel, ok := e.RouteObject(&order)
-		if ok {
-			e.NotifyTo(channel, ":memo: Submitting %s %s %s order with quantity: %f", order.Symbol, order.Type, order.Side, order.Quantity, order)
-		} else {
-			e.Notify(":memo: Submitting %s %s %s order with quantity: %f", order.Symbol, order.Type, order.Side, order.Quantity, order)
-		}
-
 		log.Infof("submitting order: %s", order.String())
 	}
 
-	e.notifySubmitOrders(formattedOrders...)
-
-	return e.Session.Exchange.SubmitOrders(ctx, formattedOrders...)
+	createdOrders, _, err := BatchPlaceOrder(ctx, e.Session.Exchange, formattedOrders...)
+	return createdOrders, err
 }
 
 func (e *ExchangeOrderExecutor) CancelOrders(ctx context.Context, orders ...types.Order) error {
@@ -312,18 +318,6 @@ func (c *BasicRiskController) ProcessOrders(session *ExchangeSession, orders ...
 	}
 
 	return outOrders, nil
-}
-
-func formatOrders(session *ExchangeSession, orders []types.SubmitOrder) (formattedOrders []types.SubmitOrder, err error) {
-	for _, order := range orders {
-		o, err := session.FormatOrder(order)
-		if err != nil {
-			return formattedOrders, err
-		}
-		formattedOrders = append(formattedOrders, o)
-	}
-
-	return formattedOrders, err
 }
 
 func max(a, b int64) int64 {
