@@ -210,7 +210,7 @@ func (s *Strategy) CrossRun(ctx context.Context, _ bbgo.OrderExecutionRouter, se
 	s.tradingSession.UserDataStream.OnTradeUpdate(s.handleTradeUpdate)
 
 	instanceID := fmt.Sprintf("%s-%s", ID, s.Symbol)
-	s.groupID = util.FNV32(instanceID)
+	s.groupID = util.FNV32(instanceID) % math.MaxInt32
 	log.Infof("using group id %d from fnv32(%s)", s.groupID, instanceID)
 
 	go func() {
@@ -331,7 +331,7 @@ func (s *Strategy) CrossRun(ctx context.Context, _ bbgo.OrderExecutionRouter, se
 						s.tradingMarket.MinNotional.Mul(NotionModifier).Div(price))
 				}
 
-				createdOrders, _, err := bbgo.BatchPlaceOrder(ctx, tradingSession.Exchange, types.SubmitOrder{
+				createdOrders, _, err := bbgo.BatchPlaceOrder(ctx, tradingSession.Exchange, nil, types.SubmitOrder{
 					Symbol:   s.Symbol,
 					Side:     types.SideTypeBuy,
 					Type:     types.OrderTypeLimit,

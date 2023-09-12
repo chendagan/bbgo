@@ -8,6 +8,9 @@ import (
 	"github.com/c9s/bbgo/pkg/types"
 )
 
+const MaxNumOfATR = 1000
+const MaxNumOfATRTruncateSize = 500
+
 //go:generate callbackgen -type ATR
 type ATR struct {
 	types.SeriesBase
@@ -71,22 +74,22 @@ func (inc *ATR) Update(high, low, cloze float64) {
 
 	// apply rolling moving average
 	inc.RMA.Update(trueRange)
-	atr := inc.RMA.Last()
+	atr := inc.RMA.Last(0)
 	inc.PercentageVolatility.Push(atr / cloze)
+	if len(inc.PercentageVolatility) > MaxNumOfATR {
+		inc.PercentageVolatility = inc.PercentageVolatility[MaxNumOfATRTruncateSize-1:]
+	}
 }
 
-func (inc *ATR) Last() float64 {
+func (inc *ATR) Last(i int) float64 {
 	if inc.RMA == nil {
 		return 0
 	}
-	return inc.RMA.Last()
+	return inc.RMA.Last(i)
 }
 
 func (inc *ATR) Index(i int) float64 {
-	if inc.RMA == nil {
-		return 0
-	}
-	return inc.RMA.Index(i)
+	return inc.Last(i)
 }
 
 func (inc *ATR) Length() int {
@@ -104,5 +107,5 @@ func (inc *ATR) PushK(k types.KLine) {
 
 	inc.Update(k.High.Float64(), k.Low.Float64(), k.Close.Float64())
 	inc.EndTime = k.EndTime.Time()
-	inc.EmitUpdate(inc.Last())
+	inc.EmitUpdate(inc.Last(0))
 }

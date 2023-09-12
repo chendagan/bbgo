@@ -26,6 +26,7 @@ import (
 	"github.com/c9s/bbgo/pkg/notifier/slacknotifier"
 	"github.com/c9s/bbgo/pkg/notifier/telegramnotifier"
 	"github.com/c9s/bbgo/pkg/service"
+	googleservice "github.com/c9s/bbgo/pkg/service/google"
 	"github.com/c9s/bbgo/pkg/slack/slacklog"
 	"github.com/c9s/bbgo/pkg/types"
 	"github.com/c9s/bbgo/pkg/util"
@@ -43,7 +44,7 @@ var BackTestService *service.BacktestService
 
 func SetBackTesting(s *service.BacktestService) {
 	BackTestService = s
-	IsBackTesting = true
+	IsBackTesting = s != nil
 }
 
 var LoadedExchangeStrategies = make(map[string]SingleExchangeStrategy)
@@ -78,18 +79,23 @@ const (
 
 // Environment presents the real exchange data layer
 type Environment struct {
-	DatabaseService *service.DatabaseService
-	OrderService    *service.OrderService
-	TradeService    *service.TradeService
-	ProfitService   *service.ProfitService
-	PositionService *service.PositionService
-	BacktestService *service.BacktestService
-	RewardService   *service.RewardService
-	MarginService   *service.MarginService
-	SyncService     *service.SyncService
-	AccountService  *service.AccountService
-	WithdrawService *service.WithdrawService
-	DepositService  *service.DepositService
+	// built-in service
+	DatabaseService   *service.DatabaseService
+	OrderService      *service.OrderService
+	TradeService      *service.TradeService
+	ProfitService     *service.ProfitService
+	PositionService   *service.PositionService
+	BacktestService   *service.BacktestService
+	RewardService     *service.RewardService
+	MarginService     *service.MarginService
+	SyncService       *service.SyncService
+	AccountService    *service.AccountService
+	WithdrawService   *service.WithdrawService
+	DepositService    *service.DepositService
+	PersistentService *service.PersistenceServiceFacade
+
+	// external services
+	GoogleSpreadSheetService *googleservice.SpreadSheetService
 
 	// startTime is the time of start point (which is used in the backtest)
 	startTime time.Time
@@ -101,6 +107,8 @@ type Environment struct {
 	syncStatusMutex sync.Mutex
 	syncStatus      SyncStatus
 	syncConfig      *SyncConfig
+
+	loggingConfig *LoggingConfig
 
 	sessions map[string]*ExchangeSession
 }
@@ -125,6 +133,10 @@ func (environ *Environment) Session(name string) (*ExchangeSession, bool) {
 
 func (environ *Environment) Sessions() map[string]*ExchangeSession {
 	return environ.sessions
+}
+
+func (environ *Environment) SetLogging(config *LoggingConfig) {
+	environ.loggingConfig = config
 }
 
 func (environ *Environment) SelectSessions(names ...string) map[string]*ExchangeSession {
@@ -209,6 +221,14 @@ func (environ *Environment) AddExchange(name string, exchange types.Exchange) (s
 	return environ.AddExchangeSession(name, session)
 }
 
+func (environ *Environment) ConfigureService(ctx context.Context, srvConfig *ServiceConfig) error {
+	if srvConfig.GoogleSpreadSheetService != nil {
+		environ.GoogleSpreadSheetService = googleservice.NewSpreadSheetService(ctx, srvConfig.GoogleSpreadSheetService.JsonTokenFile, srvConfig.GoogleSpreadSheetService.SpreadSheetID)
+	}
+
+	return nil
+}
+
 func (environ *Environment) ConfigureExchangeSessions(userConfig *Config) error {
 	// if sessions are not defined, we detect the sessions automatically
 	if len(userConfig.Sessions) == 0 {
@@ -221,12 +241,16 @@ func (environ *Environment) ConfigureExchangeSessions(userConfig *Config) error 
 func (environ *Environment) AddExchangesByViperKeys() error {
 	for _, n := range types.SupportedExchanges {
 		if viper.IsSet(string(n) + "-api-key") {
-			ex, err := exchange.NewWithEnvVarPrefix(n, "")
+			exMinimal, err := exchange.NewWithEnvVarPrefix(n, "")
 			if err != nil {
 				return err
 			}
 
-			environ.AddExchange(n.String(), ex)
+			if ex, ok := exMinimal.(types.Exchange); ok {
+				environ.AddExchange(n.String(), ex)
+			} else {
+				log.Errorf("exchange %T does not implement types.Exchange", exMinimal)
+			}
 		}
 	}
 
@@ -598,13 +622,14 @@ func (environ *Environment) syncSession(ctx context.Context, session *ExchangeSe
 	return environ.SyncService.SyncSessionSymbols(ctx, session.Exchange, environ.syncStartTime, symbols...)
 }
 
-func (environ *Environment) ConfigureNotificationSystem(userConfig *Config) error {
+func (environ *Environment) ConfigureNotificationSystem(ctx context.Context, userConfig *Config) error {
 	// setup default notification config
 	if userConfig.Notifications == nil {
 		userConfig.Notifications = &NotificationConfig{}
 	}
 
-	var persistence = persistenceServiceFacade.Get()
+	var isolation = GetIsolationFromContext(ctx)
+	var persistence = isolation.persistenceServiceFacade.Get()
 
 	err := environ.setupInteraction(persistence)
 	if err != nil {

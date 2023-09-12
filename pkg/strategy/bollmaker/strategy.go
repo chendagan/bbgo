@@ -6,7 +6,7 @@ import (
 	"math"
 	"sync"
 
-	"github.com/c9s/bbgo/pkg/indicator"
+	indicatorv2 "github.com/c9s/bbgo/pkg/indicator/v2"
 	"github.com/c9s/bbgo/pkg/util"
 
 	"github.com/pkg/errors"
@@ -82,7 +82,10 @@ type Strategy struct {
 	// For short position, you will only place buy order below the price (= average cost * (1 - minProfitSpread))
 	MinProfitSpread fixedpoint.Value `json:"minProfitSpread"`
 
-	// UseTickerPrice use the ticker api to get the mid price instead of the closed kline price.
+	// MinProfitActivationRate activates MinProfitSpread when position RoI higher than the specified percentage
+	MinProfitActivationRate *fixedpoint.Value `json:"minProfitActivationRate"`
+
+	// UseTickerPrice use the ticker api to get the mid-price instead of the closed kline price.
 	// The back-test engine is kline-based, so the ticker price api is not supported.
 	// Turn this on if you want to do real trading.
 	UseTickerPrice bool `json:"useTickerPrice"`
@@ -155,10 +158,10 @@ type Strategy struct {
 	groupID uint32
 
 	// defaultBoll is the BOLLINGER indicator we used for predicting the price.
-	defaultBoll *indicator.BOLL
+	defaultBoll *indicatorv2.BOLLStream
 
 	// neutralBoll is the neutral price section
-	neutralBoll *indicator.BOLL
+	neutralBoll *indicatorv2.BOLLStream
 
 	// StrategyController
 	bbgo.StrategyController
@@ -275,9 +278,9 @@ func (s *Strategy) placeOrders(ctx context.Context, midPrice fixedpoint.Value, k
 	baseBalance, hasBaseBalance := balances[s.Market.BaseCurrency]
 	quoteBalance, hasQuoteBalance := balances[s.Market.QuoteCurrency]
 
-	downBand := s.defaultBoll.DownBand.Last()
-	upBand := s.defaultBoll.UpBand.Last()
-	sma := s.defaultBoll.SMA.Last()
+	downBand := s.defaultBoll.DownBand.Last(0)
+	upBand := s.defaultBoll.UpBand.Last(0)
+	sma := s.defaultBoll.SMA.Last(0)
 	log.Infof("%s bollinger band: up %f sma %f down %f", s.Symbol, upBand, sma, downBand)
 
 	bandPercentage := calculateBandPercentage(upBand, downBand, sma, midPrice.Float64())
@@ -333,7 +336,7 @@ func (s *Strategy) placeOrders(ctx context.Context, midPrice fixedpoint.Value, k
 
 	// Apply quantity skew
 	// CASE #1:
-	// WHEN: price is in the neutral bollginer band (window 1) == neutral
+	// WHEN: price is in the neutral bollinger band (window 1) == neutral
 	// THEN: we don't apply skew
 	// CASE #2:
 	// WHEN: price is in the upper band (window 2 > price > window 1) == upTrend
@@ -348,7 +351,7 @@ func (s *Strategy) placeOrders(ctx context.Context, midPrice fixedpoint.Value, k
 	// WHEN: price breaks the upper band (price > window 2) == strongUpTrend
 	// THEN: we apply strongUpTrend skew
 	if s.TradeInBand {
-		if !inBetween(midPrice.Float64(), s.neutralBoll.DownBand.Last(), s.neutralBoll.UpBand.Last()) {
+		if !inBetween(midPrice.Float64(), s.neutralBoll.DownBand.Last(0), s.neutralBoll.UpBand.Last(0)) {
 			log.Infof("tradeInBand is set, skip placing orders when the price is outside of the band")
 			return
 		}
@@ -381,22 +384,25 @@ func (s *Strategy) placeOrders(ctx context.Context, midPrice fixedpoint.Value, k
 
 	isLongPosition := s.Position.IsLong()
 	isShortPosition := s.Position.IsShort()
-	minProfitPrice := s.Position.AverageCost.Mul(fixedpoint.One.Add(s.MinProfitSpread))
-	if isShortPosition {
-		minProfitPrice = s.Position.AverageCost.Mul(fixedpoint.One.Sub(s.MinProfitSpread))
-	}
 
-	if isLongPosition {
-		// for long position if the current price is lower than the minimal profitable price then we should stop sell
-		// this avoid loss trade
-		if midPrice.Compare(minProfitPrice) < 0 {
-			canSell = false
+	if s.MinProfitActivationRate == nil || (s.MinProfitActivationRate != nil && s.Position.ROI(midPrice).Compare(*s.MinProfitActivationRate) >= 0) {
+		minProfitPrice := s.Position.AverageCost.Mul(fixedpoint.One.Add(s.MinProfitSpread))
+		if isShortPosition {
+			minProfitPrice = s.Position.AverageCost.Mul(fixedpoint.One.Sub(s.MinProfitSpread))
 		}
-	} else if isShortPosition {
-		// for short position if the current price is higher than the minimal profitable price then we should stop buy
-		// this avoid loss trade
-		if midPrice.Compare(minProfitPrice) > 0 {
-			canBuy = false
+
+		if isLongPosition {
+			// for long position if the current price is lower than the minimal profitable price then we should stop sell
+			// this avoids loss trade
+			if midPrice.Compare(minProfitPrice) < 0 {
+				canSell = false
+			}
+		} else if isShortPosition {
+			// for short position if the current price is higher than the minimal profitable price then we should stop buy
+			// this avoids loss trade
+			if midPrice.Compare(minProfitPrice) > 0 {
+				canBuy = false
+			}
 		}
 	}
 
@@ -404,7 +410,7 @@ func (s *Strategy) placeOrders(ctx context.Context, midPrice fixedpoint.Value, k
 		canSell = false
 	}
 
-	if s.BuyBelowNeutralSMA && midPrice.Float64() > s.neutralBoll.SMA.Last() {
+	if s.BuyBelowNeutralSMA && midPrice.Float64() > s.neutralBoll.SMA.Last(0) {
 		canBuy = false
 	}
 
@@ -438,7 +444,10 @@ func (s *Strategy) placeOrders(ctx context.Context, midPrice fixedpoint.Value, k
 		submitOrders[i] = adjustOrderQuantity(submitOrders[i], s.Market)
 	}
 
-	_, _ = s.orderExecutor.SubmitOrders(ctx, submitOrders...)
+	_, err = s.orderExecutor.SubmitOrders(ctx, submitOrders...)
+	if err != nil {
+		log.WithError(err).Errorf("submit order error")
+	}
 }
 
 func (s *Strategy) hasLongSet() bool {
@@ -456,8 +465,8 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	// StrategyController
 	s.Status = types.StrategyStatusRunning
 
-	s.neutralBoll = s.StandardIndicatorSet.BOLL(s.NeutralBollinger.IntervalWindow, s.NeutralBollinger.BandWidth)
-	s.defaultBoll = s.StandardIndicatorSet.BOLL(s.DefaultBollinger.IntervalWindow, s.DefaultBollinger.BandWidth)
+	s.neutralBoll = session.Indicators(s.Symbol).BOLL(s.NeutralBollinger.IntervalWindow, s.NeutralBollinger.BandWidth)
+	s.defaultBoll = session.Indicators(s.Symbol).BOLL(s.DefaultBollinger.IntervalWindow, s.DefaultBollinger.BandWidth)
 
 	// Setup dynamic spread
 	if s.DynamicSpread.IsEnabled() {

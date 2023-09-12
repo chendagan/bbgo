@@ -10,8 +10,15 @@ import (
 // Refer: https://github.com/twopirllc/pandas-ta/blob/main/pandas_ta/trend/adx.py
 //
 // Directional Movement Index
-// an indicator developed by J. Welles Wilder in 1978 that identifies in which
-// direction the price of an asset is moving.
+//
+// The Directional Movement Index (DMI) is a technical analysis indicator that is used to identify the direction and strength of a trend
+// in a security's price. It was developed by J. Welles Wilder and is based on the concept of the +DI and -DI lines, which measure the strength
+// of upward and downward price movements, respectively. The DMI is calculated by taking the difference between the +DI and -DI lines, and then
+// smoothing the result using a moving average. This resulting line is called the Average Directional Index (ADX), and is used to identify whether
+// a security is trending or not. If the ADX is above a certain threshold, typically 20, it indicates that the security is in a strong trend,
+// and if it is below that threshold it indicates that the security is in a sideways or choppy market. The DMI can be used by traders to confirm
+// the direction and strength of a trend, or to identify potential entry and exit points for trades.
+
 //go:generate callbackgen -type DMI
 type DMI struct {
 	types.IntervalWindow
@@ -65,9 +72,9 @@ func (inc *DMI) Update(high, low, cloze float64) {
 	if inc.atr.Length() < inc.Window {
 		return
 	}
-	k := 100. / inc.atr.Last()
-	dmp := inc.DMP.Last()
-	dmn := inc.DMN.Last()
+	k := 100. / inc.atr.Last(0)
+	dmp := inc.DMP.Last(0)
+	dmn := inc.DMN.Last(0)
 	inc.DIPlus.Update(k * dmp)
 	inc.DIMinus.Update(k * dmn)
 	dx := 100. * math.Abs(dmp-dmn) / (dmp + dmn)
@@ -101,22 +108,10 @@ func (inc *DMI) CalculateAndUpdate(allKLines []types.KLine) {
 	if inc.ADX == nil {
 		for _, k := range allKLines {
 			inc.PushK(k)
-			inc.EmitUpdate(inc.DIPlus.Last(), inc.DIMinus.Last(), inc.ADX.Last())
+			inc.EmitUpdate(inc.DIPlus.Last(0), inc.DIMinus.Last(0), inc.ADX.Last(0))
 		}
 	} else {
 		inc.PushK(last)
-		inc.EmitUpdate(inc.DIPlus.Last(), inc.DIMinus.Last(), inc.ADX.Last())
+		inc.EmitUpdate(inc.DIPlus.Last(0), inc.DIMinus.Last(0), inc.ADX.Last(0))
 	}
-}
-
-func (inc *DMI) handleKLineWindowUpdate(interval types.Interval, window types.KLineWindow) {
-	if inc.Interval != interval {
-		return
-	}
-
-	inc.CalculateAndUpdate(window)
-}
-
-func (inc *DMI) Bind(updater KLineWindowUpdater) {
-	updater.OnKLineWindowUpdate(inc.handleKLineWindowUpdate)
 }

@@ -2,6 +2,7 @@ package bbgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/c9s/bbgo/pkg/cache"
+	"github.com/c9s/bbgo/pkg/core"
 	"github.com/c9s/bbgo/pkg/util/templateutil"
 
 	exchange2 "github.com/c9s/bbgo/pkg/exchange"
@@ -24,6 +26,8 @@ import (
 )
 
 var KLinePreloadLimit int64 = 1000
+
+var ErrEmptyMarketInfo = errors.New("market info should not be empty, 0 markets loaded")
 
 // ExchangeSession presents the exchange connection Session
 // It also maintains and collects the data returned from the stream.
@@ -104,7 +108,10 @@ type ExchangeSession struct {
 	// standard indicators of each market
 	standardIndicatorSets map[string]*StandardIndicatorSet
 
-	orderStores map[string]*OrderStore
+	// indicators is the v2 api indicators
+	indicators map[string]*IndicatorSet
+
+	orderStores map[string]*core.OrderStore
 
 	usedSymbols        map[string]struct{}
 	initializedSymbols map[string]struct{}
@@ -133,7 +140,8 @@ func NewExchangeSession(name string, exchange types.Exchange) *ExchangeSession {
 		positions:             make(map[string]*types.Position),
 		marketDataStores:      make(map[string]*MarketDataStore),
 		standardIndicatorSets: make(map[string]*StandardIndicatorSet),
-		orderStores:           make(map[string]*OrderStore),
+		indicators:            make(map[string]*IndicatorSet),
+		orderStores:           make(map[string]*core.OrderStore),
 		usedSymbols:           make(map[string]struct{}),
 		initializedSymbols:    make(map[string]struct{}),
 		logger:                log.WithField("session", name),
@@ -177,6 +185,7 @@ func (session *ExchangeSession) Init(ctx context.Context, environ *Environment) 
 	var log = log.WithField("session", session.Name)
 
 	// load markets first
+	log.Infof("querying market info from %s...", session.Name)
 
 	var disableMarketsCache = false
 	var markets types.MarketMap
@@ -191,7 +200,7 @@ func (session *ExchangeSession) Init(ctx context.Context, environ *Environment) 
 	}
 
 	if len(markets) == 0 {
-		return fmt.Errorf("market config should not be empty")
+		return ErrEmptyMarketInfo
 	}
 
 	session.markets = markets
@@ -224,6 +233,8 @@ func (session *ExchangeSession) Init(ctx context.Context, environ *Environment) 
 
 	// query and initialize the balances
 	if !session.PublicOnly {
+		log.Infof("querying account balances...")
+
 		account, err := session.Exchange.QueryAccount(ctx)
 		if err != nil {
 			return err
@@ -233,7 +244,7 @@ func (session *ExchangeSession) Init(ctx context.Context, environ *Environment) 
 		session.Account = account
 		session.accountMutex.Unlock()
 
-		log.Infof("%s account", session.Name)
+		log.Infof("account %s balances:", session.Name)
 		account.Balances().Print()
 
 		// forward trade updates and order updates to the order executor
@@ -261,10 +272,25 @@ func (session *ExchangeSession) Init(ctx context.Context, environ *Environment) 
 		}
 	}
 
-	// add trade logger
-	session.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
-		log.Info(trade.String())
-	})
+	if environ.loggingConfig != nil {
+		if environ.loggingConfig.Trade {
+			session.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
+				log.Info(trade.String())
+			})
+		}
+
+		if environ.loggingConfig.Order {
+			session.UserDataStream.OnOrderUpdate(func(order types.Order) {
+				log.Info(order.String())
+			})
+		}
+	} else {
+		// if logging config is nil, then apply default logging setup
+		// add trade logger
+		session.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
+			log.Info(trade.String())
+		})
+	}
 
 	if viper.GetBool("debug-kline") {
 		session.MarketDataStream.OnKLine(func(kline types.KLine) {
@@ -359,9 +385,11 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 
 	session.Trades[symbol] = &types.TradeSlice{Trades: trades}
 	session.UserDataStream.OnTradeUpdate(func(trade types.Trade) {
-		if trade.Symbol == symbol {
-			session.Trades[symbol].Append(trade)
+		if trade.Symbol != symbol {
+			return
 		}
+
+		session.Trades[symbol].Append(trade)
 	})
 
 	position := &types.Position{
@@ -373,7 +401,7 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 	position.BindStream(session.UserDataStream)
 	session.positions[symbol] = position
 
-	orderStore := NewOrderStore(symbol)
+	orderStore := core.NewOrderStore(symbol)
 	orderStore.AddOrderUpdate = true
 
 	orderStore.BindStream(session.UserDataStream)
@@ -395,8 +423,7 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 	// used kline intervals by the given symbol
 	var klineSubscriptions = map[types.Interval]struct{}{}
 
-	// always subscribe the 1m kline so we can make sure the connection persists.
-	klineSubscriptions[types.Interval1m] = struct{}{}
+	minInterval := types.Interval1m
 
 	// Aggregate the intervals that we are using in the subscriptions.
 	for _, sub := range session.Subscriptions {
@@ -411,11 +438,18 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 				continue
 			}
 
+			if minInterval.Seconds() > sub.Options.Interval.Seconds() {
+				minInterval = sub.Options.Interval
+			}
+
 			if sub.Symbol == symbol {
 				klineSubscriptions[types.Interval(sub.Options.Interval)] = struct{}{}
 			}
 		}
 	}
+
+	// always subscribe the 1m kline so we can make sure the connection persists.
+	klineSubscriptions[minInterval] = struct{}{}
 
 	for interval := range klineSubscriptions {
 		// avoid querying the last unclosed kline
@@ -440,7 +474,7 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 
 			// update last prices by the given kline
 			lastKLine := kLines[len(kLines)-1]
-			if interval == types.Interval1m {
+			if interval == minInterval {
 				session.lastPrices[symbol] = lastKLine.Close
 			}
 
@@ -457,7 +491,23 @@ func (session *ExchangeSession) initSymbol(ctx context.Context, environ *Environ
 	return nil
 }
 
+// Indicators returns the IndicatorSet struct that maintains the kLines stream cache and price stream cache
+// It also provides helper methods
+func (session *ExchangeSession) Indicators(symbol string) *IndicatorSet {
+	set, ok := session.indicators[symbol]
+	if ok {
+		return set
+	}
+
+	store, _ := session.MarketDataStore(symbol)
+	set = NewIndicatorSet(symbol, session.MarketDataStream, store)
+	session.indicators[symbol] = set
+	return set
+}
+
 func (session *ExchangeSession) StandardIndicatorSet(symbol string) *StandardIndicatorSet {
+	log.Warnf("StandardIndicatorSet() is deprecated in v1.49.0 and which will be removed in the next version, please use Indicators() instead")
+
 	set, ok := session.standardIndicatorSets[symbol]
 	if ok {
 		return set
@@ -497,6 +547,7 @@ func (session *ExchangeSession) Positions() map[string]*types.Position {
 // MarketDataStore returns the market data store of a symbol
 func (session *ExchangeSession) MarketDataStore(symbol string) (s *MarketDataStore, ok bool) {
 	s, ok = session.marketDataStores[symbol]
+	// FIXME: the returned MarketDataStore when !ok will be empty
 	if !ok {
 		s = NewMarketDataStore(symbol)
 		s.BindStream(session.MarketDataStream)
@@ -507,15 +558,21 @@ func (session *ExchangeSession) MarketDataStore(symbol string) (s *MarketDataSto
 }
 
 // KLine updates will be received in the order listend in intervals array
-func (session *ExchangeSession) SerialMarketDataStore(symbol string, intervals []types.Interval) (store *SerialMarketDataStore, ok bool) {
+func (session *ExchangeSession) SerialMarketDataStore(ctx context.Context, symbol string, intervals []types.Interval, useAggTrade ...bool) (store *SerialMarketDataStore, ok bool) {
 	st, ok := session.MarketDataStore(symbol)
 	if !ok {
 		return nil, false
 	}
-	store = NewSerialMarketDataStore(symbol)
-	klines, ok := st.KLinesOfInterval(types.Interval1m)
+	minInterval := types.Interval1m
+	for _, i := range intervals {
+		if minInterval.Seconds() > i.Seconds() {
+			minInterval = i
+		}
+	}
+	store = NewSerialMarketDataStore(symbol, minInterval, useAggTrade...)
+	klines, ok := st.KLinesOfInterval(minInterval)
 	if !ok {
-		log.Errorf("SerialMarketDataStore: cannot get 1m history")
+		log.Errorf("SerialMarketDataStore: cannot get %s history", minInterval)
 		return nil, false
 	}
 	for _, interval := range intervals {
@@ -524,7 +581,7 @@ func (session *ExchangeSession) SerialMarketDataStore(symbol string, intervals [
 	for _, kline := range *klines {
 		store.AddKLine(kline)
 	}
-	store.BindStream(session.MarketDataStream)
+	store.BindStream(ctx, session.MarketDataStream)
 	return store, true
 }
 
@@ -561,12 +618,12 @@ func (session *ExchangeSession) Markets() map[string]types.Market {
 	return session.markets
 }
 
-func (session *ExchangeSession) OrderStore(symbol string) (store *OrderStore, ok bool) {
+func (session *ExchangeSession) OrderStore(symbol string) (store *core.OrderStore, ok bool) {
 	store, ok = session.orderStores[symbol]
 	return store, ok
 }
 
-func (session *ExchangeSession) OrderStores() map[string]*OrderStore {
+func (session *ExchangeSession) OrderStores() map[string]*core.OrderStore {
 	return session.orderStores
 }
 
@@ -669,21 +726,39 @@ func (session *ExchangeSession) FindPossibleSymbols() (symbols []string, err err
 	return symbols, nil
 }
 
+// newBasicPrivateExchange allocates a basic exchange instance with the user private credentials
+func (session *ExchangeSession) newBasicPrivateExchange(exchangeName types.ExchangeName) (types.Exchange, error) {
+	var err error
+	var exMinimal types.ExchangeMinimal
+	if session.Key != "" && session.Secret != "" {
+		exMinimal, err = exchange2.New(exchangeName, session.Key, session.Secret, session.Passphrase)
+	} else {
+		exMinimal, err = exchange2.NewWithEnvVarPrefix(exchangeName, session.EnvVarPrefix)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if ex, ok := exMinimal.(types.Exchange); ok {
+		return ex, nil
+	}
+
+	return nil, fmt.Errorf("exchange %T does not implement types.Exchange", exMinimal)
+}
+
 // InitExchange initialize the exchange instance and allocate memory for fields
 // In this stage, the session var could be loaded from the JSON config, so the pointer fields are still nil
 // The Init method will be called after this stage, environment.Init will call the session.Init method later.
 func (session *ExchangeSession) InitExchange(name string, ex types.Exchange) error {
 	var err error
 	var exchangeName = session.ExchangeName
+
 	if ex == nil {
 		if session.PublicOnly {
 			ex, err = exchange2.NewPublic(exchangeName)
 		} else {
-			if session.Key != "" && session.Secret != "" {
-				ex, err = exchange2.NewStandard(exchangeName, session.Key, session.Secret, session.Passphrase, session.SubAccount)
-			} else {
-				ex, err = exchange2.NewWithEnvVarPrefix(exchangeName, session.EnvVarPrefix)
-			}
+			ex, err = session.newBasicPrivateExchange(exchangeName)
 		}
 	}
 
@@ -736,7 +811,8 @@ func (session *ExchangeSession) InitExchange(name string, ex types.Exchange) err
 	session.marketDataStores = make(map[string]*MarketDataStore)
 	session.positions = make(map[string]*types.Position)
 	session.standardIndicatorSets = make(map[string]*StandardIndicatorSet)
-	session.orderStores = make(map[string]*OrderStore)
+	session.indicators = make(map[string]*IndicatorSet)
+	session.orderStores = make(map[string]*core.OrderStore)
 	session.OrderExecutor = &ExchangeOrderExecutor{
 		// copy the notification system so that we can route
 		Session: session,

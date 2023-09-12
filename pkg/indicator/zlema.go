@@ -7,6 +7,12 @@ import (
 
 // Refer: Zero Lag Exponential Moving Average
 // Refer URL: https://en.wikipedia.org/wiki/Zero_lag_exponential_moving_average
+//
+// The Zero Lag Exponential Moving Average (ZLEMA) is a technical analysis indicator that is used to smooth price data and reduce the
+// lag associated with traditional moving averages. It is calculated by taking the exponentially weighted moving average of the input
+// data, and then applying a digital filter to the resulting average to eliminate any remaining lag. This filtered average is then
+// plotted on the price chart as a line, which can be used to make predictions about future price movements. The ZLEMA is typically more
+// responsive to changes in the underlying data than a simple moving average, but may be less reliable in trending markets.
 
 //go:generate callbackgen -type ZLEMA
 type ZLEMA struct {
@@ -21,17 +27,14 @@ type ZLEMA struct {
 }
 
 func (inc *ZLEMA) Index(i int) float64 {
-	if inc.zlema == nil {
-		return 0
-	}
-	return inc.zlema.Index(i)
+	return inc.Last(i)
 }
 
-func (inc *ZLEMA) Last() float64 {
+func (inc *ZLEMA) Last(i int) float64 {
 	if inc.zlema == nil {
 		return 0
 	}
-	return inc.zlema.Last()
+	return inc.zlema.Last(i)
 }
 
 func (inc *ZLEMA) Length() int {
@@ -68,12 +71,12 @@ func (inc *ZLEMA) CalculateAndUpdate(allKLines []types.KLine) {
 	if inc.zlema == nil {
 		for _, k := range allKLines {
 			inc.PushK(k)
-			inc.EmitUpdate(inc.Last())
+			inc.EmitUpdate(inc.Last(0))
 		}
 	} else {
 		k := allKLines[len(allKLines)-1]
 		inc.PushK(k)
-		inc.EmitUpdate(inc.Last())
+		inc.EmitUpdate(inc.Last(0))
 	}
 }
 

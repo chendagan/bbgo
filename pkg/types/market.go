@@ -1,53 +1,13 @@
 package types
 
 import (
-	"encoding/json"
-	"fmt"
 	"math"
-	"time"
+	"strconv"
 
 	"github.com/leekchan/accounting"
 
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 )
-
-type Duration time.Duration
-
-func (d Duration) Duration() time.Duration {
-	return time.Duration(d)
-}
-
-func (d *Duration) UnmarshalJSON(data []byte) error {
-	var o interface{}
-
-	if err := json.Unmarshal(data, &o); err != nil {
-		return err
-	}
-
-	switch t := o.(type) {
-	case string:
-		dd, err := time.ParseDuration(t)
-		if err != nil {
-			return err
-		}
-
-		*d = Duration(dd)
-
-	case float64:
-		*d = Duration(int64(t * float64(time.Second)))
-
-	case int64:
-		*d = Duration(t * int64(time.Second))
-	case int:
-		*d = Duration(t * int(time.Second))
-
-	default:
-		return fmt.Errorf("unsupported type %T value: %v", t, t)
-
-	}
-
-	return nil
-}
 
 type Market struct {
 	Symbol string `json:"symbol"`
@@ -100,7 +60,85 @@ func (m Market) IsDustQuantity(quantity, price fixedpoint.Value) bool {
 
 // TruncateQuantity uses the step size to truncate floating number, in order to avoid the rounding issue
 func (m Market) TruncateQuantity(quantity fixedpoint.Value) fixedpoint.Value {
-	return fixedpoint.MustNewFromString(m.FormatQuantity(quantity))
+	var ts = m.StepSize.Float64()
+	var prec = int(math.Round(math.Log10(ts) * -1.0))
+	var pow10 = math.Pow10(prec)
+
+	qf := math.Trunc(quantity.Float64() * pow10)
+	qf = qf / pow10
+
+	qs := strconv.FormatFloat(qf, 'f', prec, 64)
+	return fixedpoint.MustNewFromString(qs)
+}
+
+// TruncateQuoteQuantity uses the tick size to truncate floating number, in order to avoid the rounding issue
+// this is usually used for calculating the order size from the quote quantity.
+func (m Market) TruncateQuoteQuantity(quantity fixedpoint.Value) fixedpoint.Value {
+	var ts = m.TickSize.Float64()
+	var prec = int(math.Round(math.Log10(ts) * -1.0))
+	var pow10 = math.Pow10(prec)
+
+	qf := math.Trunc(quantity.Float64() * pow10)
+	qf = qf / pow10
+
+	qs := strconv.FormatFloat(qf, 'f', prec, 64)
+	return fixedpoint.MustNewFromString(qs)
+}
+
+// GreaterThanMinimalOrderQuantity ensures that your given balance could fit the minimal order quantity
+// when side = sell, then available = base balance
+// when side = buy, then available = quote balance
+// The balance will be truncated first in order to calculate the minimal notional and minimal quantity
+// The adjusted (truncated) order quantity will be returned
+func (m Market) GreaterThanMinimalOrderQuantity(side SideType, price, available fixedpoint.Value) (fixedpoint.Value, bool) {
+	switch side {
+	case SideTypeSell:
+		available = m.TruncateQuantity(available)
+
+		if available.Compare(m.MinQuantity) < 0 {
+			return fixedpoint.Zero, false
+		}
+
+		quoteAmount := price.Mul(available)
+		if quoteAmount.Compare(m.MinNotional) < 0 {
+			return fixedpoint.Zero, false
+		}
+
+		return available, true
+
+	case SideTypeBuy:
+		available = m.TruncateQuoteQuantity(available)
+
+		if available.Compare(m.MinNotional) < 0 {
+			return fixedpoint.Zero, false
+		}
+
+		quantity := available.Div(price)
+		quantity = m.TruncateQuantity(quantity)
+		if quantity.Compare(m.MinQuantity) < 0 {
+			return fixedpoint.Zero, false
+		}
+
+		notional := quantity.Mul(price)
+		if notional.Compare(m.MinNotional) < 0 {
+			return fixedpoint.Zero, false
+		}
+
+		return quantity, true
+	}
+
+	return available, true
+}
+
+// RoundDownQuantityByPrecision uses the volume precision to round down the quantity
+// This is different from the TruncateQuantity, which uses StepSize (it uses fewer fractions to truncate)
+func (m Market) RoundDownQuantityByPrecision(quantity fixedpoint.Value) fixedpoint.Value {
+	return quantity.Round(m.VolumePrecision, fixedpoint.Down)
+}
+
+// RoundUpQuantityByPrecision uses the volume precision to round up the quantity
+func (m Market) RoundUpQuantityByPrecision(quantity fixedpoint.Value) fixedpoint.Value {
+	return quantity.Round(m.VolumePrecision, fixedpoint.Up)
 }
 
 func (m Market) TruncatePrice(price fixedpoint.Value) fixedpoint.Value {
@@ -150,11 +188,11 @@ func (m Market) FormatPriceCurrency(val fixedpoint.Value) string {
 
 func (m Market) FormatPrice(val fixedpoint.Value) string {
 	// p := math.Pow10(m.PricePrecision)
-	return formatPrice(val, m.TickSize)
+	return FormatPrice(val, m.TickSize)
 }
 
-func formatPrice(price fixedpoint.Value, tickSize fixedpoint.Value) string {
-	prec := int(math.Round(math.Abs(math.Log10(tickSize.Float64()))))
+func FormatPrice(price fixedpoint.Value, tickSize fixedpoint.Value) string {
+	prec := int(math.Round(math.Log10(tickSize.Float64()) * -1.0))
 	return price.FormatString(prec)
 }
 
@@ -175,6 +213,22 @@ func (m Market) CanonicalizeVolume(val fixedpoint.Value) float64 {
 	// TODO Round
 	p := math.Pow10(m.VolumePrecision)
 	return math.Trunc(p*val.Float64()) / p
+}
+
+// AdjustQuantityByMinNotional adjusts the quantity to make the amount greater than the given minAmount
+func (m Market) AdjustQuantityByMinNotional(quantity, currentPrice fixedpoint.Value) fixedpoint.Value {
+	// modify quantity for the min amount
+	amount := currentPrice.Mul(quantity)
+	if amount.Compare(m.MinNotional) < 0 {
+		ratio := m.MinNotional.Div(amount)
+		quantity = quantity.Mul(ratio)
+
+		ts := m.StepSize.Float64()
+		prec := int(math.Round(math.Log10(ts) * -1.0))
+		return quantity.Round(prec, fixedpoint.Up)
+	}
+
+	return quantity
 }
 
 type MarketMap map[string]Market

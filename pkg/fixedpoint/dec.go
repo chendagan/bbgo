@@ -131,7 +131,7 @@ func NewFromInt(n int64) Value {
 	if n == 0 {
 		return Zero
 	}
-	//n0 := n
+	// n0 := n
 	sign := int8(signPos)
 	if n < 0 {
 		n = -n
@@ -270,25 +270,46 @@ func (dn Value) FormatString(prec int) string {
 	nd := len(digits)
 	e := int(dn.exp) - nd
 	if -maxLeadingZeros <= dn.exp && dn.exp <= 0 {
+		if prec < 0 {
+			return "0"
+		}
 		// decimal to the left
 		if prec+e+nd > 0 {
 			return sign + "0." + strings.Repeat("0", -e-nd) + digits[:min(prec+e+nd, nd)] + strings.Repeat("0", max(0, prec-nd+e+nd))
-		} else if -e-nd > 0 {
-			return "0." + strings.Repeat("0", -e-nd)
+		} else if -e-nd > 0 && prec != 0 {
+			return "0." + strings.Repeat("0", min(prec, -e-nd))
 		} else {
 			return "0"
 		}
 	} else if -nd < e && e <= -1 {
 		// decimal within
 		dec := nd + e
-		decimals := digits[dec:min(dec+prec, nd)]
-		return sign + digits[:dec] + "." + decimals + strings.Repeat("0", max(0, prec-len(decimals)))
+		if prec > 0 {
+			decimals := digits[dec:min(dec+prec, nd)]
+			return sign + digits[:dec] + "." + decimals + strings.Repeat("0", max(0, prec-len(decimals)))
+		} else if prec == 0 {
+			return sign + digits[:dec]
+		}
+
+		sigFigures := digits[0:max(dec+prec, 0)]
+		if len(sigFigures) == 0 {
+			return "0"
+		}
+
+		return sign + sigFigures + strings.Repeat("0", max(-prec, 0))
+
 	} else if 0 < dn.exp && dn.exp <= digitsMax {
 		// decimal to the right
 		if prec > 0 {
 			return sign + digits + strings.Repeat("0", e) + "." + strings.Repeat("0", prec)
-		} else {
+		} else if prec+e >= 0 {
 			return sign + digits + strings.Repeat("0", e)
+		} else {
+			if len(digits) <= -prec-e {
+				return "0"
+			}
+
+			return sign + digits[0:len(digits)+prec+e] + strings.Repeat("0", -prec)
 		}
 	} else {
 		// scientific notation
@@ -527,7 +548,7 @@ func NewFromString(s string) (Value, error) {
 		coef *= pow10[p]
 		exp -= p
 	}
-	//check(coefMin <= coef && coef <= coefMax)
+	// check(coefMin <= coef && coef <= coefMax)
 	return Value{coef, sign, exp}, nil
 }
 
@@ -577,7 +598,7 @@ func NewFromBytes(s []byte) (Value, error) {
 		coef *= pow10[p]
 		exp -= p
 	}
-	//check(coefMin <= coef && coef <= coefMax)
+	// check(coefMin <= coef && coef <= coefMax)
 	return Value{coef, sign, exp}, nil
 }
 
@@ -958,6 +979,10 @@ func (dn Value) integer(mode RoundingMode) Value {
 	return Value{i, dn.sign, dn.exp}
 }
 
+func (dn Value) Floor() Value {
+	return dn.Round(0, Down)
+}
+
 func (dn Value) Round(r int, mode RoundingMode) Value {
 	if dn.sign == 0 || dn.sign == signNegInf || dn.sign == signPosInf ||
 		r >= digitsMax {
@@ -1171,9 +1196,10 @@ func align(x, y *Value) bool {
 		return false
 	}
 	yshift = e
-	//check(0 <= yshift && yshift <= 20)
-	y.coef = (y.coef + halfpow10[yshift]) / pow10[yshift]
-	//check(int(y.exp)+yshift == int(x.exp))
+	// check(0 <= yshift && yshift <= 20)
+	//y.coef = (y.coef + halfpow10[yshift]) / pow10[yshift]
+	y.coef = (y.coef) / pow10[yshift]
+	// check(int(y.exp)+yshift == int(x.exp))
 	return true
 }
 
@@ -1278,7 +1304,7 @@ func (dn Value) Format(mask string) string {
 	nd := len(digits)
 
 	di := e - before
-	//check(di <= 0)
+	// check(di <= 0)
 	var buf strings.Builder
 	sign := n.Sign()
 	signok := (sign >= 0)
@@ -1318,4 +1344,24 @@ func (dn Value) Format(mask string) string {
 		return "-" // negative not handled by mask
 	}
 	return buf.String()
+}
+
+func Clamp(x, min, max Value) Value {
+	if x.Compare(min) < 0 {
+		return min
+	}
+	if x.Compare(max) > 0 {
+		return max
+	}
+	return x
+}
+
+func (x Value) Clamp(min, max Value) Value {
+	if x.Compare(min) < 0 {
+		return min
+	}
+	if x.Compare(max) > 0 {
+		return max
+	}
+	return x
 }

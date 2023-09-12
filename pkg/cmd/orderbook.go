@@ -14,7 +14,7 @@ import (
 	"github.com/c9s/bbgo/pkg/types"
 )
 
-// go run ./cmd/bbgo orderbook --session=ftx --symbol=BTCUSDT
+// go run ./cmd/bbgo orderbook --session=binance --symbol=BTCUSDT
 var orderbookCmd = &cobra.Command{
 	Use:   "orderbook --session=[exchange_name] --symbol=[pair_name]",
 	Short: "connect to the order book market data streaming service of an exchange",
@@ -71,9 +71,10 @@ var orderbookCmd = &cobra.Command{
 			}
 
 			if bid, ask, ok := orderBook.BestBidAndAsk(); ok {
-				log.Infof("ASK | %f x %f / %f x %f | BID",
+				log.Infof("ASK | %f x %f / %f x %f | BID | %s",
 					ask.Volume.Float64(), ask.Price.Float64(),
-					bid.Price.Float64(), bid.Volume.Float64())
+					bid.Price.Float64(), bid.Volume.Float64(),
+					book.Time.String())
 			}
 		})
 
@@ -84,9 +85,10 @@ var orderbookCmd = &cobra.Command{
 			orderBook.Update(book)
 
 			if bid, ask, ok := orderBook.BestBidAndAsk(); ok {
-				log.Infof("ASK | %f x %f / %f x %f | BID",
+				log.Infof("ASK | %f x %f / %f x %f | BID | %s",
 					ask.Volume.Float64(), ask.Price.Float64(),
-					bid.Price.Float64(), bid.Volume.Float64())
+					bid.Price.Float64(), bid.Volume.Float64(),
+					book.Time.String())
 			}
 		})
 

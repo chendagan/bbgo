@@ -9,6 +9,13 @@ import (
 
 // Refer: Variable Index Dynamic Average
 // Refer URL: https://metatrader5.com/en/terminal/help/indicators/trend_indicators/vida
+// The Variable Index Dynamic Average (VIDYA) is a technical analysis indicator that is used to smooth price data and reduce the lag
+// associated with traditional moving averages. It is calculated by taking the weighted moving average of the input data, with the
+// weighting factors determined using a variable index that is based on the standard deviation of the data and the specified length of
+// the moving average. This resulting average is then plotted on the price chart as a line, which can be used to make predictions about
+// future price movements. The VIDYA is typically more responsive to changes in the underlying data than a simple moving average, but may
+// be less reliable in trending markets.
+
 //go:generate callbackgen -type VIDYA
 type VIDYA struct {
 	types.SeriesBase
@@ -51,18 +58,18 @@ func (inc *VIDYA) Update(value float64) {
 	change := types.Change(&inc.input)
 	CMO := math.Abs(types.Sum(change, inc.Window) / types.Sum(types.Abs(change), inc.Window))
 	alpha := 2. / float64(inc.Window+1)
-	inc.Values.Push(value*alpha*CMO + inc.Values.Last()*(1.-alpha*CMO))
+	inc.Values.Push(value*alpha*CMO + inc.Values.Last(0)*(1.-alpha*CMO))
 	if inc.Values.Length() > MaxNumOfEWMA {
 		inc.Values = inc.Values[MaxNumOfEWMATruncateSize-1:]
 	}
 }
 
-func (inc *VIDYA) Last() float64 {
-	return inc.Values.Last()
+func (inc *VIDYA) Last(i int) float64 {
+	return inc.Values.Last(i)
 }
 
 func (inc *VIDYA) Index(i int) float64 {
-	return inc.Values.Index(i)
+	return inc.Last(i)
 }
 
 func (inc *VIDYA) Length() int {
@@ -79,12 +86,12 @@ func (inc *VIDYA) CalculateAndUpdate(allKLines []types.KLine) {
 	if inc.input.Length() == 0 {
 		for _, k := range allKLines {
 			inc.PushK(k)
-			inc.EmitUpdate(inc.Last())
+			inc.EmitUpdate(inc.Last(0))
 		}
 	} else {
 		k := allKLines[len(allKLines)-1]
 		inc.PushK(k)
-		inc.EmitUpdate(inc.Last())
+		inc.EmitUpdate(inc.Last(0))
 	}
 }
 

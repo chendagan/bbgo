@@ -12,6 +12,17 @@ import (
 
 var logst = logrus.WithField("indicator", "supertrend")
 
+// The Super Trend is a technical analysis indicator that is used to identify potential buy and sell signals in a security's price. It is
+// calculated by combining the exponential moving average (EMA) and the average true range (ATR) of the security's price, and then plotting
+// the resulting value on the price chart as a line. The Super Trend line is typically used to identify potential entry and exit points
+// for trades, and can be used to confirm other technical analysis signals. It is typically more responsive to changes in the underlying
+// data than other trend-following indicators, but may be less reliable in trending markets. It is important to note that the Super Trend is a
+// lagging indicator, which means that it may not always provide accurate or timely signals.
+//
+// To use Super Trend, identify potential entry and exit points for trades by looking for crossovers or divergences between the Super Trend line
+// and the security's price. For example, a buy signal may be generated when the Super Trend line crosses above the security's price, while a sell
+// signal may be generated when the Super Trend line crosses below the security's price.
+
 //go:generate callbackgen -type Supertrend
 type Supertrend struct {
 	types.SeriesBase
@@ -20,7 +31,9 @@ type Supertrend struct {
 
 	AverageTrueRange *ATR
 
-	trendPrices floats.Slice
+	trendPrices    floats.Slice // Value of the trend line (buy or sell)
+	supportLine    floats.Slice // The support line in an uptrend (green)
+	resistanceLine floats.Slice // The resistance line in a downtrend (red)
 
 	closePrice             float64
 	previousClosePrice     float64
@@ -37,16 +50,12 @@ type Supertrend struct {
 	UpdateCallbacks []func(value float64)
 }
 
-func (inc *Supertrend) Last() float64 {
-	return inc.trendPrices.Last()
+func (inc *Supertrend) Last(i int) float64 {
+	return inc.trendPrices.Last(i)
 }
 
 func (inc *Supertrend) Index(i int) float64 {
-	length := inc.Length()
-	if length == 0 || length-i-1 < 0 {
-		return 0
-	}
-	return inc.trendPrices[length-i-1]
+	return inc.Last(i)
 }
 
 func (inc *Supertrend) Length() int {
@@ -81,13 +90,13 @@ func (inc *Supertrend) Update(highPrice, lowPrice, closePrice float64) {
 	src := (highPrice + lowPrice) / 2
 
 	// Update uptrend
-	inc.uptrendPrice = src - inc.AverageTrueRange.Last()*inc.ATRMultiplier
+	inc.uptrendPrice = src - inc.AverageTrueRange.Last(0)*inc.ATRMultiplier
 	if inc.previousClosePrice > inc.previousUptrendPrice {
 		inc.uptrendPrice = math.Max(inc.uptrendPrice, inc.previousUptrendPrice)
 	}
 
 	// Update downtrend
-	inc.downtrendPrice = src + inc.AverageTrueRange.Last()*inc.ATRMultiplier
+	inc.downtrendPrice = src + inc.AverageTrueRange.Last(0)*inc.ATRMultiplier
 	if inc.previousClosePrice < inc.previousDowntrendPrice {
 		inc.downtrendPrice = math.Min(inc.downtrendPrice, inc.previousDowntrendPrice)
 	}
@@ -102,7 +111,7 @@ func (inc *Supertrend) Update(highPrice, lowPrice, closePrice float64) {
 	}
 
 	// Update signal
-	if inc.AverageTrueRange.Last() <= 0 {
+	if inc.AverageTrueRange.Last(0) <= 0 {
 		inc.tradeSignal = types.DirectionNone
 	} else if inc.trend == types.DirectionUp && inc.previousTrend == types.DirectionDown {
 		inc.tradeSignal = types.DirectionUp
@@ -119,13 +128,32 @@ func (inc *Supertrend) Update(highPrice, lowPrice, closePrice float64) {
 		inc.trendPrices.Push(inc.uptrendPrice)
 	}
 
+	// Save the trend lines
+	inc.supportLine.Push(inc.uptrendPrice)
+	inc.resistanceLine.Push(inc.downtrendPrice)
+
 	logst.Debugf("Update supertrend result: closePrice: %v, uptrendPrice: %v, downtrendPrice: %v, trend: %v,"+
 		" tradeSignal: %v, AverageTrueRange.Last(): %v", inc.closePrice, inc.uptrendPrice, inc.downtrendPrice,
-		inc.trend, inc.tradeSignal, inc.AverageTrueRange.Last())
+		inc.trend, inc.tradeSignal, inc.AverageTrueRange.Last(0))
 }
 
 func (inc *Supertrend) GetSignal() types.Direction {
 	return inc.tradeSignal
+}
+
+// GetDirection return the current trend
+func (inc *Supertrend) Direction() types.Direction {
+	return inc.trend
+}
+
+// LastSupertrendSupport return the current supertrend support
+func (inc *Supertrend) LastSupertrendSupport() float64 {
+	return inc.supportLine.Last(0)
+}
+
+// LastSupertrendResistance return the current supertrend resistance
+func (inc *Supertrend) LastSupertrendResistance() float64 {
+	return inc.resistanceLine.Last(0)
 }
 
 var _ types.SeriesExtend = &Supertrend{}
@@ -137,7 +165,7 @@ func (inc *Supertrend) PushK(k types.KLine) {
 
 	inc.Update(k.GetHigh().Float64(), k.GetLow().Float64(), k.GetClose().Float64())
 	inc.EndTime = k.EndTime.Time()
-	inc.EmitUpdate(inc.Last())
+	inc.EmitUpdate(inc.Last(0))
 
 }
 
@@ -160,7 +188,7 @@ func (inc *Supertrend) CalculateAndUpdate(kLines []types.KLine) {
 		inc.PushK(k)
 	}
 
-	inc.EmitUpdate(inc.Last())
+	inc.EmitUpdate(inc.Last(0))
 	inc.EndTime = kLines[len(kLines)-1].EndTime.Time()
 }
 

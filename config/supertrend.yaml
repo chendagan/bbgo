@@ -18,8 +18,8 @@ backtest:
   # for testing max draw down (MDD) at 03-12
   # see here for more details
   # https://www.investopedia.com/terms/m/maximum-drawdown-mdd.asp
-  startTime: "2022-01-01"
-  endTime: "2022-06-30"
+  startTime: "2022-05-01"
+  endTime: "2022-10-31"
   symbols:
   - BTCUSDT
   accounts:
@@ -27,7 +27,7 @@ backtest:
       makerCommission: 10  # 0.15%
       takerCommission: 15  # 0.15%
       balances:
-        BTC: 1.0
+        BTC: 50.0
         USDT: 10000.0
 
 exchangeStrategies:
@@ -39,9 +39,9 @@ exchangeStrategies:
     interval: 1m
 
     # ATR window used by Supertrend
-    window: 34
+    window: 220
     # ATR Multiplier for calculating super trend prices, the higher, the stronger the trends are
-    supertrendMultiplier: 4
+    supertrendMultiplier: 10
 
     # leverage uses the account net value to calculate the order qty
     leverage: 1.0
@@ -49,13 +49,13 @@ exchangeStrategies:
     #quantity: 0.5
 
     # fastDEMAWindow and slowDEMAWindow are for filtering super trend noise
-    fastDEMAWindow: 40
-    slowDEMAWindow: 49
+    fastDEMAWindow: 28
+    slowDEMAWindow: 170
 
     # Use linear regression as trend confirmation
     linearRegression:
       interval: 1m
-      window: 74
+      window: 18
 
     # TP according to ATR multiple, 0 to disable this
     TakeProfitAtrMultiplier: 0
@@ -80,19 +80,45 @@ exchangeStrategies:
     exits:
       # roiStopLoss is the stop loss percentage of the position ROI (currently the price change)
       - roiStopLoss:
-          percentage: 4.5%
-      - protectiveStopLoss:
-          activationRatio: 3%
-          stopLossRatio: 2.5%
-          placeStopOrder: false
-      - protectiveStopLoss:
-          activationRatio: 7%
-          stopLossRatio: 3.5%
-          placeStopOrder: false
+          percentage: 2%
       - trailingStop:
-          callbackRate: 4.5%
-          #activationRatio: 40%
-          minProfit: 9.5%
+          callbackRate: 2%
+          #activationRatio: 20%
+          minProfit: 10%
           interval: 1m
           side: both
           closePosition: 100%
+      - higherHighLowerLowStopLoss:
+          # interval is the kline interval used by this exit
+          interval: 15m
+          # window is used as the range to determining higher highs and lower lows
+          window: 5
+          # highLowWindow is the range to calculate the number of higher highs and lower lows
+          highLowWindow: 12
+          # If the number of higher highs or lower lows with in HighLowWindow is less than MinHighLow, the exit is
+          # triggered. 0 disables this parameter. Either one of MaxHighLow and MinHighLow must be larger than 0
+          minHighLow: 2
+          # If the number of higher highs or lower lows with in HighLowWindow is more than MaxHighLow, the exit is
+          # triggered. 0 disables this parameter. Either one of MaxHighLow and MinHighLow must be larger than 0
+          maxHighLow: 0
+          # ActivationRatio is the trigger condition
+          # When the price goes higher (lower for short position) than this ratio, the stop will be activated.
+          # You can use this to combine several exits
+          activationRatio: 0.5%
+          # DeactivationRatio is the kill condition
+          #	When the price goes higher (lower for short position) than this ratio, the stop will be deactivated.
+          #	You can use this to combine several exits
+          deactivationRatio: 10%
+          # If true, looking for lower lows in long position and higher highs in short position. If false, looking for
+          # higher highs in long position and lower lows in short position
+          oppositeDirectionAsPosition: false
+
+    profitStatsTracker:
+      interval: 1d
+      window: 30
+      accumulatedProfitReport:
+        profitMAWindow: 60
+        shortTermProfitWindow: 14
+        accumulateTradeWindow: 30
+        tsvReportPath: res.tsv
+    trackParameters: false

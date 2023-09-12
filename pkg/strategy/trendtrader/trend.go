@@ -2,6 +2,7 @@ package trendtrader
 
 import (
 	"context"
+
 	"github.com/c9s/bbgo/pkg/bbgo"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/indicator"
@@ -64,15 +65,15 @@ func (s *TrendLine) Bind(session *bbgo.ExchangeSession, orderExecutor *bbgo.Gene
 	supportSlope2 := 0.
 
 	session.MarketDataStream.OnKLineClosed(types.KLineWith(s.Symbol, s.Interval, func(kline types.KLine) {
-		if s.pivotHigh.Last() != resistancePrices.Last() {
-			resistancePrices.Update(s.pivotHigh.Last())
+		if s.pivotHigh.Last(0) != resistancePrices.Last(0) {
+			resistancePrices.Update(s.pivotHigh.Last(0))
 			resistanceDuration.Update(pivotHighDurationCounter)
 			pivotHighDurationCounter = 0
 		} else {
 			pivotHighDurationCounter++
 		}
-		if s.pivotLow.Last() != supportPrices.Last() {
-			supportPrices.Update(s.pivotLow.Last())
+		if s.pivotLow.Last(0) != supportPrices.Last(0) {
+			supportPrices.Update(s.pivotLow.Last(0))
 			supportDuration.Update(pivotLowDurationCounter)
 			pivotLowDurationCounter = 0
 		} else {
@@ -94,8 +95,8 @@ func (s *TrendLine) Bind(session *bbgo.ExchangeSession, orderExecutor *bbgo.Gene
 
 		if converge(resistanceSlope, supportSlope) {
 			// y = mx+b
-			currentResistance := resistanceSlope*pivotHighDurationCounter + resistancePrices.Last()
-			currentSupport := supportSlope*pivotLowDurationCounter + supportPrices.Last()
+			currentResistance := resistanceSlope*pivotHighDurationCounter + resistancePrices.Last(0)
+			currentSupport := supportSlope*pivotLowDurationCounter + supportPrices.Last(0)
 			log.Info(currentResistance, currentSupport, kline.Close)
 
 			if kline.High.Float64() > currentResistance {
@@ -149,8 +150,5 @@ func line(p1, p2, p3 float64) int64 {
 }
 
 func converge(mr, ms float64) bool {
-	if ms > mr {
-		return true
-	}
-	return false
+	return ms > mr
 }

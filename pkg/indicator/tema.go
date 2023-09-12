@@ -7,6 +7,14 @@ import (
 
 // Refer: Triple Exponential Moving Average (TEMA)
 // URL: https://investopedia.com/terms/t/triple-exponential-moving-average.asp
+//
+// The Triple Exponential Moving Average (TEMA) is a technical analysis indicator that is used to smooth price data and reduce the lag
+// associated with traditional moving averages. It is calculated by taking the exponentially weighted moving average of the input data,
+// and then taking the exponentially weighted moving average of that result, and then taking the exponentially weighted moving average of
+// that result. This triple-smoothing process helps to eliminate much of the noise in the original data and provides a more accurate
+// representation of the underlying trend. The TEMA line is then plotted on the price chart, which can be used to make predictions about
+// future price movements. The TEMA is typically more responsive to changes in the underlying data than a simple moving average, but may be
+// less reliable in trending markets.
 
 //go:generate callbackgen -type TEMA
 type TEMA struct {
@@ -28,26 +36,20 @@ func (inc *TEMA) Update(value float64) {
 		inc.A3 = &EWMA{IntervalWindow: inc.IntervalWindow}
 	}
 	inc.A1.Update(value)
-	a1 := inc.A1.Last()
+	a1 := inc.A1.Last(0)
 	inc.A2.Update(a1)
-	a2 := inc.A2.Last()
+	a2 := inc.A2.Last(0)
 	inc.A3.Update(a2)
-	a3 := inc.A3.Last()
+	a3 := inc.A3.Last(0)
 	inc.Values.Push(3*a1 - 3*a2 + a3)
 }
 
-func (inc *TEMA) Last() float64 {
-	if len(inc.Values) > 0 {
-		return inc.Values[len(inc.Values)-1]
-	}
-	return 0.0
+func (inc *TEMA) Last(i int) float64 {
+	return inc.Values.Last(i)
 }
 
 func (inc *TEMA) Index(i int) float64 {
-	if i >= len(inc.Values) {
-		return 0
-	}
-	return inc.Values[len(inc.Values)-i-1]
+	return inc.Last(i)
 }
 
 func (inc *TEMA) Length() int {
@@ -64,12 +66,12 @@ func (inc *TEMA) CalculateAndUpdate(allKLines []types.KLine) {
 	if inc.A1 == nil {
 		for _, k := range allKLines {
 			inc.PushK(k)
-			inc.EmitUpdate(inc.Last())
+			inc.EmitUpdate(inc.Last(0))
 		}
 	} else {
 		k := allKLines[len(allKLines)-1]
 		inc.PushK(k)
-		inc.EmitUpdate(inc.Last())
+		inc.EmitUpdate(inc.Last(0))
 	}
 }
 

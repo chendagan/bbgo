@@ -88,6 +88,8 @@ type Trader struct {
 	crossExchangeStrategies []CrossExchangeStrategy
 	exchangeStrategies      map[string][]SingleExchangeStrategy
 
+	// gracefulShutdown is used for registering strategy's Shutdown calls
+	// when strategy implements Shutdown(ctx), the func ref will be stored in the callback.
 	gracefulShutdown GracefulShutdown
 
 	logger Logger
@@ -166,52 +168,6 @@ func (trader *Trader) SetRiskControls(riskControls *RiskControls) {
 	trader.riskControls = riskControls
 }
 
-func (trader *Trader) Subscribe() {
-	// pre-subscribe the data
-	for sessionName, strategies := range trader.exchangeStrategies {
-		session := trader.environment.sessions[sessionName]
-		for _, strategy := range strategies {
-			if defaulter, ok := strategy.(StrategyDefaulter); ok {
-				if err := defaulter.Defaults(); err != nil {
-					panic(err)
-				}
-			}
-
-			if initializer, ok := strategy.(StrategyInitializer); ok {
-				if err := initializer.Initialize(); err != nil {
-					panic(err)
-				}
-			}
-
-			if subscriber, ok := strategy.(ExchangeSessionSubscriber); ok {
-				subscriber.Subscribe(session)
-			} else {
-				log.Errorf("strategy %s does not implement ExchangeSessionSubscriber", strategy.ID())
-			}
-		}
-	}
-
-	for _, strategy := range trader.crossExchangeStrategies {
-		if defaulter, ok := strategy.(StrategyDefaulter); ok {
-			if err := defaulter.Defaults(); err != nil {
-				panic(err)
-			}
-		}
-
-		if initializer, ok := strategy.(StrategyInitializer); ok {
-			if err := initializer.Initialize(); err != nil {
-				panic(err)
-			}
-		}
-
-		if subscriber, ok := strategy.(CrossExchangeSessionSubscriber); ok {
-			subscriber.CrossSubscribe(trader.environment.sessions)
-		} else {
-			log.Errorf("strategy %s does not implement CrossExchangeSessionSubscriber", strategy.ID())
-		}
-	}
-}
-
 func (trader *Trader) RunSingleExchangeStrategy(ctx context.Context, strategy SingleExchangeStrategy, session *ExchangeSession, orderExecutor OrderExecutor) error {
 	if v, ok := strategy.(StrategyValidator); ok {
 		if err := v.Validate(); err != nil {
@@ -262,11 +218,10 @@ func (trader *Trader) RunAllSingleExchangeStrategy(ctx context.Context) error {
 	return nil
 }
 
-func (trader *Trader) injectFields() error {
+func (trader *Trader) injectFieldsAndSubscribe(ctx context.Context) error {
 	// load and run Session strategies
 	for sessionName, strategies := range trader.exchangeStrategies {
 		var session = trader.environment.sessions[sessionName]
-		var orderExecutor = trader.getSessionOrderExecutor(sessionName)
 		for _, strategy := range strategies {
 			rs := reflect.ValueOf(strategy)
 
@@ -277,16 +232,34 @@ func (trader *Trader) injectFields() error {
 				return errors.New("strategy object is not a struct")
 			}
 
-			if err := trader.injectCommonServices(strategy); err != nil {
+			if err := trader.injectCommonServices(ctx, strategy); err != nil {
 				return err
 			}
 
-			if err := dynamic.InjectField(rs, "OrderExecutor", orderExecutor, false); err != nil {
-				return errors.Wrapf(err, "failed to inject OrderExecutor on %T", strategy)
+			if defaulter, ok := strategy.(StrategyDefaulter); ok {
+				if err := defaulter.Defaults(); err != nil {
+					panic(err)
+				}
+			}
+
+			if initializer, ok := strategy.(StrategyInitializer); ok {
+				if err := initializer.Initialize(); err != nil {
+					panic(err)
+				}
+			}
+
+			if subscriber, ok := strategy.(ExchangeSessionSubscriber); ok {
+				subscriber.Subscribe(session)
+			} else {
+				log.Errorf("strategy %s does not implement ExchangeSessionSubscriber", strategy.ID())
 			}
 
 			if symbol, ok := dynamic.LookupSymbolField(rs); ok {
-				log.Infof("found symbol based strategy from %s", rs.Type())
+				log.Infof("found symbol %s based strategy from %s", symbol, rs.Type())
+
+				if err := session.initSymbol(ctx, trader.environment, symbol); err != nil {
+					return errors.Wrapf(err, "failed to inject object into %T when initSymbol", strategy)
+				}
 
 				market, ok := session.Market(symbol)
 				if !ok {
@@ -325,8 +298,26 @@ func (trader *Trader) injectFields() error {
 			continue
 		}
 
-		if err := trader.injectCommonServices(strategy); err != nil {
+		if err := trader.injectCommonServices(ctx, strategy); err != nil {
 			return err
+		}
+
+		if defaulter, ok := strategy.(StrategyDefaulter); ok {
+			if err := defaulter.Defaults(); err != nil {
+				return err
+			}
+		}
+
+		if initializer, ok := strategy.(StrategyInitializer); ok {
+			if err := initializer.Initialize(); err != nil {
+				return err
+			}
+		}
+
+		if subscriber, ok := strategy.(CrossExchangeSessionSubscriber); ok {
+			subscriber.CrossSubscribe(trader.environment.sessions)
+		} else {
+			log.Errorf("strategy %s does not implement CrossExchangeSessionSubscriber", strategy.ID())
 		}
 	}
 
@@ -339,11 +330,9 @@ func (trader *Trader) Run(ctx context.Context) error {
 	// trader.environment.Connect will call interact.Start
 	interact.AddCustomInteraction(NewCoreInteraction(trader.environment, trader))
 
-	if err := trader.injectFields(); err != nil {
+	if err := trader.injectFieldsAndSubscribe(ctx); err != nil {
 		return err
 	}
-
-	trader.Subscribe()
 
 	if err := trader.environment.Start(ctx); err != nil {
 		return err
@@ -371,16 +360,14 @@ func (trader *Trader) Run(ctx context.Context) error {
 	return trader.environment.Connect(ctx)
 }
 
-func (trader *Trader) LoadState() error {
+func (trader *Trader) LoadState(ctx context.Context) error {
 	if trader.environment.BacktestService != nil {
 		return nil
 	}
 
-	if persistenceServiceFacade == nil {
-		return nil
-	}
+	isolation := GetIsolationFromContext(ctx)
 
-	ps := persistenceServiceFacade.Get()
+	ps := isolation.persistenceServiceFacade.Get()
 
 	log.Infof("loading strategies states...")
 
@@ -408,18 +395,17 @@ func (trader *Trader) IterateStrategies(f func(st StrategyID) error) error {
 	return nil
 }
 
-func (trader *Trader) SaveState() error {
+// NOTICE: the ctx here is the trading context, which could already be canceled.
+func (trader *Trader) SaveState(ctx context.Context) error {
 	if trader.environment.BacktestService != nil {
 		return nil
 	}
 
-	if persistenceServiceFacade == nil {
-		return nil
-	}
+	isolation := GetIsolationFromContext(ctx)
 
-	ps := persistenceServiceFacade.Get()
+	ps := isolation.persistenceServiceFacade.Get()
 
-	log.Infof("saving strategies states...")
+	log.Debugf("saving strategy persistence states...")
 	return trader.IterateStrategies(func(strategy StrategyID) error {
 		id := dynamic.CallID(strategy)
 		if len(id) == 0 {
@@ -434,7 +420,11 @@ func (trader *Trader) Shutdown(ctx context.Context) {
 	trader.gracefulShutdown.Shutdown(ctx)
 }
 
-func (trader *Trader) injectCommonServices(s interface{}) error {
+func (trader *Trader) injectCommonServices(ctx context.Context, s interface{}) error {
+	isolation := GetIsolationFromContext(ctx)
+
+	ps := isolation.persistenceServiceFacade
+
 	// a special injection for persistence selector:
 	// if user defined the selector, the facade pointer will be nil, hence we need to update the persistence facade pointer
 	sv := reflect.ValueOf(s).Elem()
@@ -446,7 +436,7 @@ func (trader *Trader) injectCommonServices(s interface{}) error {
 				return fmt.Errorf("field Persistence is not a struct element, %s given", field)
 			}
 
-			if err := dynamic.InjectField(elem, "Facade", persistenceServiceFacade, true); err != nil {
+			if err := dynamic.InjectField(elem.Interface(), "Facade", ps, true); err != nil {
 				return err
 			}
 
@@ -466,6 +456,6 @@ func (trader *Trader) injectCommonServices(s interface{}) error {
 		trader.environment.DatabaseService,
 		trader.environment.AccountService,
 		trader.environment,
-		persistenceServiceFacade, // if the strategy use persistence facade separately
+		ps, // if the strategy use persistence facade separately
 	)
 }

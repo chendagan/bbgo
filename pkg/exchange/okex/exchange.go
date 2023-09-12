@@ -17,12 +17,16 @@ import (
 
 var marketDataLimiter = rate.NewLimiter(rate.Every(time.Second/10), 1)
 
-// OKB is the platform currency of OKEx, pre-allocate static string here
-const OKB = "OKB"
+const ID = "okex"
+
+// PlatformToken is the platform currency of OKEx, pre-allocate static string here
+const PlatformToken = "OKB"
 
 var log = logrus.WithFields(logrus.Fields{
-	"exchange": "okex",
+	"exchange": ID,
 })
+
+var ErrSymbolRequired = errors.New("symbol is a required parameter")
 
 type Exchange struct {
 	key, secret, passphrase string
@@ -38,8 +42,7 @@ func New(key, secret, passphrase string) *Exchange {
 	}
 
 	return &Exchange{
-		key: key,
-		// pragma: allowlist nextline secret
+		key:        key,
 		secret:     secret,
 		passphrase: passphrase,
 		client:     client,
@@ -51,7 +54,7 @@ func (e *Exchange) Name() types.ExchangeName {
 }
 
 func (e *Exchange) QueryMarkets(ctx context.Context) (types.MarketMap, error) {
-	instruments, err := e.client.PublicDataService.NewGetInstrumentsRequest().
+	instruments, err := e.client.NewGetInstrumentsRequest().
 		InstrumentType(okexapi.InstrumentTypeSpot).
 		Do(ctx)
 
@@ -95,7 +98,7 @@ func (e *Exchange) QueryMarkets(ctx context.Context) (types.MarketMap, error) {
 func (e *Exchange) QueryTicker(ctx context.Context, symbol string) (*types.Ticker, error) {
 	symbol = toLocalSymbol(symbol)
 
-	marketTicker, err := e.client.MarketTicker(symbol)
+	marketTicker, err := e.client.MarketTicker(ctx, symbol)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +107,7 @@ func (e *Exchange) QueryTicker(ctx context.Context, symbol string) (*types.Ticke
 }
 
 func (e *Exchange) QueryTickers(ctx context.Context, symbols ...string) (map[string]types.Ticker, error) {
-	marketTickers, err := e.client.MarketTickers(okexapi.InstrumentTypeSpot)
+	marketTickers, err := e.client.MarketTickers(ctx, okexapi.InstrumentTypeSpot)
 	if err != nil {
 		return nil, err
 	}
@@ -131,17 +134,17 @@ func (e *Exchange) QueryTickers(ctx context.Context, symbols ...string) (map[str
 }
 
 func (e *Exchange) PlatformFeeCurrency() string {
-	return OKB
+	return PlatformToken
 }
 
 func (e *Exchange) QueryAccount(ctx context.Context) (*types.Account, error) {
-	accountBalance, err := e.client.AccountBalances()
+	accountBalance, err := e.client.AccountBalances(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	var account = types.Account{
-		AccountType: "SPOT",
+		AccountType: types.AccountTypeSpot,
 	}
 
 	var balanceMap = toGlobalBalance(accountBalance)
@@ -150,7 +153,7 @@ func (e *Exchange) QueryAccount(ctx context.Context) (*types.Account, error) {
 }
 
 func (e *Exchange) QueryAccountBalances(ctx context.Context) (types.BalanceMap, error) {
-	accountBalances, err := e.client.AccountBalances()
+	accountBalances, err := e.client.AccountBalances(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +163,7 @@ func (e *Exchange) QueryAccountBalances(ctx context.Context) (types.BalanceMap, 
 }
 
 func (e *Exchange) SubmitOrder(ctx context.Context, order types.SubmitOrder) (*types.Order, error) {
-	orderReq := e.client.TradeService.NewPlaceOrderRequest()
+	orderReq := e.client.NewPlaceOrderRequest()
 
 	orderType, err := toLocalOrderType(order.Type)
 	if err != nil {
@@ -254,7 +257,7 @@ func (e *Exchange) SubmitOrder(ctx context.Context, order types.SubmitOrder) (*t
 
 func (e *Exchange) QueryOpenOrders(ctx context.Context, symbol string) (orders []types.Order, err error) {
 	instrumentID := toLocalSymbol(symbol)
-	req := e.client.TradeService.NewGetPendingOrderRequest().InstrumentType(okexapi.InstrumentTypeSpot).InstrumentID(instrumentID)
+	req := e.client.NewGetPendingOrderRequest().InstrumentType(okexapi.InstrumentTypeSpot).InstrumentID(instrumentID)
 	orderDetails, err := req.Do(ctx)
 	if err != nil {
 		return orders, err
@@ -272,10 +275,10 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) erro
 	var reqs []*okexapi.CancelOrderRequest
 	for _, order := range orders {
 		if len(order.Symbol) == 0 {
-			return errors.New("symbol is required for canceling an okex order")
+			return ErrSymbolRequired
 		}
 
-		req := e.client.TradeService.NewCancelOrderRequest()
+		req := e.client.NewCancelOrderRequest()
 		req.InstrumentID(toLocalSymbol(order.Symbol))
 		req.OrderID(strconv.FormatUint(order.OrderID, 10))
 		if len(order.ClientOrderID) > 0 {
@@ -284,7 +287,7 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) erro
 		reqs = append(reqs, req)
 	}
 
-	batchReq := e.client.TradeService.NewBatchCancelOrderRequest()
+	batchReq := e.client.NewBatchCancelOrderRequest()
 	batchReq.Add(reqs...)
 	_, err := batchReq.Do(ctx)
 	return err
@@ -301,7 +304,7 @@ func (e *Exchange) QueryKLines(ctx context.Context, symbol string, interval type
 
 	intervalParam := toLocalInterval(interval.String())
 
-	req := e.client.MarketDataService.NewCandlesticksRequest(toLocalSymbol(symbol))
+	req := e.client.NewCandlesticksRequest(toLocalSymbol(symbol))
 	req.Bar(intervalParam)
 
 	if options.StartTime != nil {
@@ -337,4 +340,26 @@ func (e *Exchange) QueryKLines(ctx context.Context, symbol string, interval type
 
 	return klines, nil
 
+}
+
+func (e *Exchange) QueryOrder(ctx context.Context, q types.OrderQuery) (*types.Order, error) {
+	if len(q.Symbol) == 0 {
+		return nil, ErrSymbolRequired
+	}
+	if len(q.OrderID) == 0 && len(q.ClientOrderID) == 0 {
+		return nil, errors.New("okex.QueryOrder: OrderId or ClientOrderId is required parameter")
+	}
+	req := e.client.NewGetOrderDetailsRequest()
+	req.InstrumentID(q.Symbol).
+		OrderID(q.OrderID).
+		ClientOrderID(q.ClientOrderID)
+
+	var order *okexapi.OrderDetails
+	order, err := req.Do(ctx)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return toGlobalOrder(order)
 }

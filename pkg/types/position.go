@@ -58,6 +58,9 @@ type Position struct {
 
 	AccumulatedProfit fixedpoint.Value `json:"accumulatedProfit,omitempty" db:"accumulated_profit"`
 
+	// closing is a flag for marking this position is closing
+	closing bool
+
 	sync.Mutex
 
 	// Modify position callbacks
@@ -170,7 +173,12 @@ func (p *Position) NewMarketCloseOrder(percentage fixedpoint.Value) *SubmitOrder
 	}
 }
 
-func (p *Position) IsDust(price fixedpoint.Value) bool {
+func (p *Position) IsDust(a ...fixedpoint.Value) bool {
+	price := p.AverageCost
+	if len(a) > 0 {
+		price = a[0]
+	}
+
 	base := p.Base.Abs()
 	return p.Market.IsDustQuantity(base, price)
 }
@@ -296,6 +304,7 @@ func (p *Position) Reset() {
 	p.Base = fixedpoint.Zero
 	p.Quote = fixedpoint.Zero
 	p.AverageCost = fixedpoint.Zero
+	p.TotalFee = make(map[string]fixedpoint.Value)
 }
 
 func (p *Position) SetFeeRate(exchangeFee ExchangeFee) {
@@ -420,6 +429,25 @@ func (p *Position) BindStream(stream Stream) {
 			p.AddTrade(trade)
 		}
 	})
+}
+
+func (p *Position) SetClosing(c bool) bool {
+	p.Lock()
+	defer p.Unlock()
+
+	if p.closing && c {
+		return false
+	}
+
+	p.closing = c
+	return true
+}
+
+func (p *Position) IsClosing() (c bool) {
+	p.Lock()
+	c = p.closing
+	p.Unlock()
+	return c
 }
 
 func (p *Position) AddTrades(trades []Trade) (fixedpoint.Value, fixedpoint.Value, bool) {

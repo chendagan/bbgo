@@ -8,17 +8,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/heroku/rollrus"
 	"github.com/joho/godotenv"
-	"github.com/lestrrat-go/file-rotatelogs"
+	rotatelogs "github.com/lestrrat-go/file-rotatelogs"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rifflock/lfshook"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/x-cray/logrus-prefixed-formatter"
+	prefixed "github.com/x-cray/logrus-prefixed-formatter"
 
 	"github.com/c9s/bbgo/pkg/bbgo"
+	"github.com/c9s/bbgo/pkg/util"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -42,6 +44,44 @@ var RootCmd = &cobra.Command{
 		if viper.GetBool("debug") {
 			log.Infof("debug mode is enabled")
 			log.SetLevel(log.DebugLevel)
+		}
+
+		env := os.Getenv("BBGO_ENV")
+		if env == "" {
+			env = "development"
+		}
+
+		logFormatter, err := cmd.Flags().GetString("log-formatter")
+		if err != nil {
+			return err
+		}
+
+		if len(logFormatter) == 0 {
+			switch env {
+			case "production", "prod", "stag", "staging":
+				// always use json formatter for production and staging
+				log.SetFormatter(&log.JSONFormatter{})
+			default:
+				log.SetFormatter(&prefixed.TextFormatter{})
+			}
+		} else {
+			switch logFormatter {
+			case "prefixed":
+				log.SetFormatter(&prefixed.TextFormatter{})
+			case "text":
+				log.SetFormatter(&log.TextFormatter{})
+			case "json":
+				log.SetFormatter(&log.JSONFormatter{})
+			}
+		}
+
+		if token := viper.GetString("rollbar-token"); token != "" {
+			log.Infof("found rollbar token %q, setting up rollbar hook...", util.MaskKey(token))
+
+			log.AddHook(rollrus.NewHook(
+				token,
+				env,
+			))
 		}
 
 		if viper.GetBool("metrics") {
@@ -149,6 +189,10 @@ func init() {
 
 	RootCmd.PersistentFlags().String("config", "bbgo.yaml", "config file")
 
+	RootCmd.PersistentFlags().String("log-formatter", "", "configure log formatter")
+
+	RootCmd.PersistentFlags().String("rollbar-token", "", "rollbar token")
+
 	// A flag can be 'persistent' meaning that this flag will be available to
 	// the command it's assigned to as well as every command under that command.
 	// For global flags, assign a flag as a persistent flag on the root.
@@ -165,9 +209,6 @@ func init() {
 	RootCmd.PersistentFlags().String("max-api-key", "", "max api key")
 	RootCmd.PersistentFlags().String("max-api-secret", "", "max api secret")
 
-	RootCmd.PersistentFlags().String("ftx-api-key", "", "ftx api key")
-	RootCmd.PersistentFlags().String("ftx-api-secret", "", "ftx api secret")
-	RootCmd.PersistentFlags().String("ftx-subaccount", "", "subaccount name. Specify it if the credential is for subaccount.")
 	RootCmd.PersistentFlags().String("cpu-profile", "", "cpu profile")
 
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
@@ -196,16 +237,15 @@ func init() {
 		return
 	}
 
-	log.SetFormatter(&prefixed.TextFormatter{})
-}
-
-func Execute() {
 	environment := os.Getenv("BBGO_ENV")
+	logDir := "log"
 	switch environment {
 	case "production", "prod":
-
+		if err := os.MkdirAll(logDir, 0777); err != nil {
+			log.Panic(err)
+		}
 		writer, err := rotatelogs.New(
-			path.Join("log", "access_log.%Y%m%d"),
+			path.Join(logDir, "access_log.%Y%m%d"),
 			rotatelogs.WithLinkName("access_log"),
 			// rotatelogs.WithMaxAge(24 * time.Hour),
 			rotatelogs.WithRotationTime(time.Duration(24)*time.Hour),
@@ -213,8 +253,8 @@ func Execute() {
 		if err != nil {
 			log.Panic(err)
 		}
-		logger := log.StandardLogger()
-		logger.AddHook(
+
+		log.AddHook(
 			lfshook.NewHook(
 				lfshook.WriterMap{
 					log.DebugLevel: writer,
@@ -222,12 +262,13 @@ func Execute() {
 					log.WarnLevel:  writer,
 					log.ErrorLevel: writer,
 					log.FatalLevel: writer,
-				},
-				&log.JSONFormatter{},
-			),
+				}, &log.JSONFormatter{}),
 		)
-	}
 
+	}
+}
+
+func Execute() {
 	if err := RootCmd.Execute(); err != nil {
 		log.WithError(err).Fatalf("cannot execute command")
 	}

@@ -2,18 +2,20 @@ package bbgo
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
-	"sync/atomic"
 	"time"
 
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/multierr"
 
+	"github.com/c9s/bbgo/pkg/core"
+	"github.com/c9s/bbgo/pkg/exchange/retry"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
 	"github.com/c9s/bbgo/pkg/util"
+	"github.com/c9s/bbgo/pkg/util/backoff"
 )
 
 var ErrExceededSubmitOrderRetryLimit = errors.New("exceeded submit order retry limit")
@@ -25,20 +27,45 @@ var quantityReduceDelta = fixedpoint.NewFromFloat(0.005)
 // This is for the maximum retries
 const submitOrderRetryLimit = 5
 
+type BaseOrderExecutor struct {
+	session           *ExchangeSession
+	activeMakerOrders *ActiveOrderBook
+	orderStore        *core.OrderStore
+}
+
+func (e *BaseOrderExecutor) OrderStore() *core.OrderStore {
+	return e.orderStore
+}
+
+func (e *BaseOrderExecutor) ActiveMakerOrders() *ActiveOrderBook {
+	return e.activeMakerOrders
+}
+
+// GracefulCancel cancels all active maker orders if orders are not given, otherwise cancel all the given orders
+func (e *BaseOrderExecutor) GracefulCancel(ctx context.Context, orders ...types.Order) error {
+	if err := e.activeMakerOrders.GracefulCancel(ctx, e.session.Exchange, orders...); err != nil {
+		return errors.Wrap(err, "graceful cancel error")
+	}
+
+	return nil
+}
+
 // GeneralOrderExecutor implements the general order executor for strategy
 type GeneralOrderExecutor struct {
-	session            *ExchangeSession
+	BaseOrderExecutor
+
 	symbol             string
 	strategy           string
 	strategyInstanceID string
 	position           *types.Position
-	activeMakerOrders  *ActiveOrderBook
-	orderStore         *OrderStore
-	tradeCollector     *TradeCollector
+	tradeCollector     *core.TradeCollector
+
+	logger log.FieldLogger
 
 	marginBaseMaxBorrowable, marginQuoteMaxBorrowable fixedpoint.Value
 
-	closing int64
+	maxRetries    uint
+	disableNotify bool
 }
 
 func NewGeneralOrderExecutor(session *ExchangeSession, symbol, strategy, strategyInstanceID string, position *types.Position) *GeneralOrderExecutor {
@@ -46,24 +73,35 @@ func NewGeneralOrderExecutor(session *ExchangeSession, symbol, strategy, strateg
 	position.Strategy = strategy
 	position.StrategyInstanceID = strategyInstanceID
 
-	orderStore := NewOrderStore(symbol)
+	orderStore := core.NewOrderStore(symbol)
 
 	executor := &GeneralOrderExecutor{
-		session:            session,
+		BaseOrderExecutor: BaseOrderExecutor{
+			session:           session,
+			activeMakerOrders: NewActiveOrderBook(symbol),
+			orderStore:        orderStore,
+		},
+
 		symbol:             symbol,
 		strategy:           strategy,
 		strategyInstanceID: strategyInstanceID,
 		position:           position,
-		activeMakerOrders:  NewActiveOrderBook(symbol),
-		orderStore:         orderStore,
-		tradeCollector:     NewTradeCollector(symbol, position, orderStore),
+		tradeCollector:     core.NewTradeCollector(symbol, position, orderStore),
 	}
 
-	if session.Margin {
+	if session != nil && session.Margin {
 		executor.startMarginAssetUpdater(context.Background())
 	}
 
 	return executor
+}
+
+func (e *GeneralOrderExecutor) DisableNotify() {
+	e.disableNotify = true
+}
+
+func (e *GeneralOrderExecutor) SetMaxRetries(maxRetries uint) {
+	e.maxRetries = maxRetries
 }
 
 func (e *GeneralOrderExecutor) startMarginAssetUpdater(ctx context.Context) {
@@ -110,10 +148,6 @@ func (e *GeneralOrderExecutor) marginAssetMaxBorrowableUpdater(ctx context.Conte
 	}
 }
 
-func (e *GeneralOrderExecutor) ActiveMakerOrders() *ActiveOrderBook {
-	return e.activeMakerOrders
-}
-
 func (e *GeneralOrderExecutor) BindEnvironment(environ *Environment) {
 	e.tradeCollector.OnProfit(func(trade types.Trade, profit *types.Profit) {
 		environ.RecordPosition(e.position, trade, profit)
@@ -139,8 +173,10 @@ func (e *GeneralOrderExecutor) BindProfitStats(profitStats *types.ProfitStats) {
 
 		profitStats.AddProfit(*profit)
 
-		Notify(profit)
-		Notify(profitStats)
+		if !e.disableNotify {
+			Notify(profit)
+			Notify(profitStats)
+		}
 	})
 }
 
@@ -148,15 +184,17 @@ func (e *GeneralOrderExecutor) Bind() {
 	e.activeMakerOrders.BindStream(e.session.UserDataStream)
 	e.orderStore.BindStream(e.session.UserDataStream)
 
-	// trade notify
-	e.tradeCollector.OnTrade(func(trade types.Trade, profit, netProfit fixedpoint.Value) {
-		Notify(trade)
-	})
+	if !e.disableNotify {
+		// trade notify
+		e.tradeCollector.OnTrade(func(trade types.Trade, profit, netProfit fixedpoint.Value) {
+			Notify(trade)
+		})
 
-	e.tradeCollector.OnPositionUpdate(func(position *types.Position) {
-		log.Infof("position changed: %s", position)
-		Notify(position)
-	})
+		e.tradeCollector.OnPositionUpdate(func(position *types.Position) {
+			log.Infof("position changed: %s", position)
+			Notify(position)
+		})
+	}
 
 	e.tradeCollector.BindStream(e.session.UserDataStream)
 }
@@ -170,25 +208,29 @@ func (e *GeneralOrderExecutor) CancelOrders(ctx context.Context, orders ...types
 	return err
 }
 
+func (e *GeneralOrderExecutor) SetLogger(logger log.FieldLogger) {
+	e.logger = logger
+}
+
 func (e *GeneralOrderExecutor) SubmitOrders(ctx context.Context, submitOrders ...types.SubmitOrder) (types.OrderSlice, error) {
 	formattedOrders, err := e.session.FormatOrders(submitOrders)
 	if err != nil {
 		return nil, err
 	}
 
-	createdOrders, errIdx, err := BatchPlaceOrder(ctx, e.session.Exchange, formattedOrders...)
-	if len(errIdx) > 0 {
-		createdOrders2, err2 := BatchRetryPlaceOrder(ctx, e.session.Exchange, errIdx, formattedOrders...)
-		if err2 != nil {
-			err = multierr.Append(err, err2)
-		} else {
-			createdOrders = append(createdOrders, createdOrders2...)
-		}
+	orderCreateCallback := func(createdOrder types.Order) {
+		e.orderStore.Add(createdOrder)
+		e.activeMakerOrders.Add(createdOrder)
 	}
 
-	e.orderStore.Add(createdOrders...)
-	e.activeMakerOrders.Add(createdOrders...)
-	e.tradeCollector.Process()
+	defer e.tradeCollector.Process()
+
+	if e.maxRetries == 0 {
+		createdOrders, _, err := BatchPlaceOrder(ctx, e.session.Exchange, orderCreateCallback, formattedOrders...)
+		return createdOrders, err
+	}
+
+	createdOrders, _, err := BatchRetryPlaceOrder(ctx, e.session.Exchange, nil, orderCreateCallback, e.logger, formattedOrders...)
 	return createdOrders, err
 }
 
@@ -230,7 +272,7 @@ func (e *GeneralOrderExecutor) reduceQuantityAndSubmitOrder(ctx context.Context,
 	var err error
 	for i := 0; i < submitOrderRetryLimit; i++ {
 		q := submitOrder.Quantity.Mul(fixedpoint.One.Sub(quantityReduceDelta))
-		if !e.session.Futures {
+		if !e.session.Futures && !e.session.Margin {
 			if submitOrder.Side == types.SideTypeSell {
 				if baseBalance, ok := e.session.GetAccount().Balance(e.position.Market.BaseCurrency); ok {
 					q = fixedpoint.Min(q, baseBalance.Available)
@@ -245,7 +287,7 @@ func (e *GeneralOrderExecutor) reduceQuantityAndSubmitOrder(ctx context.Context,
 
 		submitOrder.Quantity = q
 		if e.position.Market.IsDustQuantity(submitOrder.Quantity, price) {
-			return nil, types.NewZeroAssetError(nil)
+			return nil, types.NewZeroAssetError(fmt.Errorf("dust quantity, quantity = %f, price = %f", submitOrder.Quantity.Float64(), price.Float64()))
 		}
 
 		createdOrder, err2 := e.SubmitOrders(ctx, submitOrder)
@@ -262,7 +304,12 @@ func (e *GeneralOrderExecutor) reduceQuantityAndSubmitOrder(ctx context.Context,
 	return nil, multierr.Append(ErrExceededSubmitOrderRetryLimit, err)
 }
 
-func (e *GeneralOrderExecutor) OpenPosition(ctx context.Context, options OpenPositionOptions) (types.OrderSlice, error) {
+// Create new submitOrder from OpenPositionOptions.
+// @param ctx: golang context type.
+// @param options: OpenPositionOptions to control the generated SubmitOrder in a higher level way. Notice that the Price in options will be updated as the submitOrder price.
+// @return *types.SubmitOrder: SubmitOrder with calculated quantity and price.
+// @return error: Error message.
+func (e *GeneralOrderExecutor) NewOrderFromOpenPosition(ctx context.Context, options *OpenPositionOptions) (*types.SubmitOrder, error) {
 	price := options.Price
 	submitOrder := types.SubmitOrder{
 		Symbol:           e.position.Symbol,
@@ -284,9 +331,11 @@ func (e *GeneralOrderExecutor) OpenPosition(ctx context.Context, options OpenPos
 		if options.Long {
 			// use higher price to buy (this ensures that our order will be filled)
 			price = price.Mul(one.Add(options.LimitOrderTakerRatio))
+			options.Price = price
 		} else if options.Short {
 			// use lower price to sell (this ensures that our order will be filled)
 			price = price.Mul(one.Sub(options.LimitOrderTakerRatio))
+			options.Price = price
 		}
 	}
 
@@ -304,10 +353,15 @@ func (e *GeneralOrderExecutor) OpenPosition(ctx context.Context, options OpenPos
 				return nil, err
 			}
 
+			if price.IsZero() {
+				return nil, errors.New("unable to calculate quantity: zero price given")
+			}
+
 			quantity = quoteQuantity.Div(price)
 		}
+
 		if e.position.Market.IsDustQuantity(quantity, price) {
-			log.Warnf("dust quantity: %v", quantity)
+			log.Errorf("can not submit order: dust quantity, quantity = %f, price = %f", quantity.Float64(), price.Float64())
 			return nil, nil
 		}
 
@@ -320,14 +374,7 @@ func (e *GeneralOrderExecutor) OpenPosition(ctx context.Context, options OpenPos
 		submitOrder.Side = types.SideTypeBuy
 		submitOrder.Quantity = quantity
 
-		Notify("Opening %s long position with quantity %v at price %v", e.position.Symbol, quantity, price)
-
-		createdOrder, err := e.SubmitOrders(ctx, submitOrder)
-		if err == nil {
-			return createdOrder, nil
-		}
-
-		return e.reduceQuantityAndSubmitOrder(ctx, price, submitOrder)
+		return &submitOrder, nil
 	} else if options.Short {
 		if quantity.IsZero() {
 			var err error
@@ -350,82 +397,99 @@ func (e *GeneralOrderExecutor) OpenPosition(ctx context.Context, options OpenPos
 		submitOrder.Side = types.SideTypeSell
 		submitOrder.Quantity = quantity
 
-		Notify("Opening %s short position with quantity %v at price %v", e.position.Symbol, quantity, price)
-		return e.reduceQuantityAndSubmitOrder(ctx, price, submitOrder)
+		return &submitOrder, nil
 	}
 
 	return nil, errors.New("options Long or Short must be set")
 }
 
-// GracefulCancelActiveOrderBook cancels the orders from the active orderbook.
-func (e *GeneralOrderExecutor) GracefulCancelActiveOrderBook(ctx context.Context, activeOrders *ActiveOrderBook, orders ...types.Order) error {
-	if activeOrders.NumOfOrders() == 0 {
-		return nil
-	}
-	if err := activeOrders.GracefulCancel(ctx, e.session.Exchange, orders...); err != nil {
-		// Retry once
-		if err = activeOrders.GracefulCancel(ctx, e.session.Exchange); err != nil {
-			return fmt.Errorf("graceful cancel order error: %w", err)
-		}
+// OpenPosition sends the orders generated from OpenPositionOptions to the exchange by calling SubmitOrders or reduceQuantityAndSubmitOrder.
+// @param ctx: golang context type.
+// @param options: OpenPositionOptions to control the generated SubmitOrder in a higher level way. Notice that the Price in options will be updated as the submitOrder price.
+// @return types.OrderSlice: Created orders with information from exchange.
+// @return error: Error message.
+func (e *GeneralOrderExecutor) OpenPosition(ctx context.Context, options OpenPositionOptions) (types.OrderSlice, error) {
+	if e.position.IsClosing() {
+		return nil, errors.Wrap(ErrPositionAlreadyClosing, "unable to open position")
 	}
 
-	e.tradeCollector.Process()
-	return nil
+	submitOrder, err := e.NewOrderFromOpenPosition(ctx, &options)
+	if err != nil {
+		return nil, err
+	}
+
+	if submitOrder == nil {
+		return nil, nil
+	}
+
+	price := options.Price
+
+	side := "long"
+	if submitOrder.Side == types.SideTypeSell {
+		side = "short"
+	}
+
+	Notify("Opening %s %s position with quantity %f at price %f", e.position.Symbol, side, submitOrder.Quantity.Float64(), price.Float64())
+
+	createdOrder, err := e.SubmitOrders(ctx, *submitOrder)
+	if err == nil {
+		return createdOrder, nil
+	}
+
+	log.WithError(err).Errorf("unable to submit order: %v", err)
+	log.Infof("reduce quantity and retry order")
+	return e.reduceQuantityAndSubmitOrder(ctx, price, *submitOrder)
 }
 
-// CancelActiveOrderBookNoWait cancels the orders from the active orderbook without waiting
-func (e *GeneralOrderExecutor) CancelActiveOrderBookNoWait(ctx context.Context, activeOrders *ActiveOrderBook, orders ...types.Order) error {
+// GracefulCancelActiveOrderBook cancels the orders from the active orderbook.
+func (e *GeneralOrderExecutor) GracefulCancelActiveOrderBook(ctx context.Context, activeOrders *ActiveOrderBook) error {
 	if activeOrders.NumOfOrders() == 0 {
 		return nil
 	}
-	if err := activeOrders.CancelNoWait(ctx, e.session.Exchange, orders...); err != nil {
-		return fmt.Errorf("cancel order error: %w", err)
-	}
-	return nil
+
+	defer e.tradeCollector.Process()
+
+	op := func() error { return activeOrders.GracefulCancel(ctx, e.session.Exchange) }
+	return backoff.RetryGeneral(ctx, op)
 }
 
 // GracefulCancel cancels all active maker orders if orders are not given, otherwise cancel all the given orders
 func (e *GeneralOrderExecutor) GracefulCancel(ctx context.Context, orders ...types.Order) error {
-	return e.GracefulCancelActiveOrderBook(ctx, e.activeMakerOrders, orders...)
+	if err := e.activeMakerOrders.GracefulCancel(ctx, e.session.Exchange, orders...); err != nil {
+		return errors.Wrap(err, "graceful cancel error")
+	}
+
+	return nil
 }
 
-// CancelNoWait cancels all active maker orders if orders is not given, otherwise cancel the given orders
-func (e *GeneralOrderExecutor) CancelNoWait(ctx context.Context, orders ...types.Order) error {
-	return e.CancelActiveOrderBookNoWait(ctx, e.activeMakerOrders, orders...)
-}
+var ErrPositionAlreadyClosing = errors.New("position is already in closing process")
 
 // ClosePosition closes the current position by a percentage.
 // percentage 0.1 means close 10% position
 // tag is the order tag you want to attach, you may pass multiple tags, the tags will be combined into one tag string by commas.
 func (e *GeneralOrderExecutor) ClosePosition(ctx context.Context, percentage fixedpoint.Value, tags ...string) error {
+	if !e.position.SetClosing(true) {
+		return ErrPositionAlreadyClosing
+	}
+	defer e.position.SetClosing(false)
+
 	submitOrder := e.position.NewMarketCloseOrder(percentage)
 	if submitOrder == nil {
 		return nil
 	}
 
-	if e.closing > 0 {
-		log.Errorf("position is already closing")
-		return nil
-	}
-
-	atomic.AddInt64(&e.closing, 1)
-	defer atomic.StoreInt64(&e.closing, 0)
-
 	if e.session.Futures { // Futures: Use base qty in e.position
 		submitOrder.Quantity = e.position.GetBase().Abs()
 		submitOrder.ReduceOnly = true
+
 		if e.position.IsLong() {
 			submitOrder.Side = types.SideTypeSell
 		} else if e.position.IsShort() {
 			submitOrder.Side = types.SideTypeBuy
 		} else {
-			submitOrder.Side = types.SideTypeSelf
-			submitOrder.Quantity = fixedpoint.Zero
+			return fmt.Errorf("unexpected position side: %+v", e.position)
 		}
 
-		if submitOrder.Quantity.IsZero() {
-			return fmt.Errorf("no position to close: %+v", submitOrder)
-		}
 	} else { // Spot and spot margin
 		// check base balance and adjust the close position order
 		if e.position.IsLong() {
@@ -449,13 +513,27 @@ func (e *GeneralOrderExecutor) ClosePosition(ctx context.Context, percentage fix
 	tagStr := strings.Join(tags, ",")
 	submitOrder.Tag = tagStr
 
-	Notify("Closing %s position %s with tags: %v", e.symbol, percentage.Percentage(), tagStr)
+	Notify("Closing %s position %s with tags: %s", e.symbol, percentage.Percentage(), tagStr)
 
-	_, err := e.SubmitOrders(ctx, *submitOrder)
-	return err
+	createdOrders, err := e.SubmitOrders(ctx, *submitOrder)
+	if err != nil {
+		return err
+	}
+
+	if queryOrderService, ok := e.session.Exchange.(types.ExchangeOrderQueryService); ok && !IsBackTesting {
+		switch submitOrder.Type {
+		case types.OrderTypeMarket:
+			_, err2 := retry.QueryOrderUntilFilled(ctx, queryOrderService, createdOrders[0].Symbol, createdOrders[0].OrderID)
+			if err2 != nil {
+				log.WithError(err2).Errorf("unable to query order")
+			}
+		}
+	}
+
+	return nil
 }
 
-func (e *GeneralOrderExecutor) TradeCollector() *TradeCollector {
+func (e *GeneralOrderExecutor) TradeCollector() *core.TradeCollector {
 	return e.tradeCollector
 }
 

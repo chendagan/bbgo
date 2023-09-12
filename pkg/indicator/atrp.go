@@ -11,9 +11,17 @@ import (
 // ATRP is the average true range percentage
 // See also https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/atrp
 //
+// The Average True Range Percentage (ATRP) is a technical analysis indicator that measures the volatility of a security's price. It is
+// calculated by dividing the Average True Range (ATR) of the security by its closing price, and then multiplying the result by 100 to convert
+// it to a percentage. The ATR is a measure of the range of a security's price, taking into account gaps between trading periods and any limit
+// moves (sharp price movements that are allowed under certain exchange rules). The ATR is typically smoothed using a moving average to make it
+// more responsive to changes in the underlying price data. The ATRP is a useful indicator for traders because it provides a way to compare the
+// volatility of different securities, regardless of their individual prices. It can also be used to identify potential entry and exit points
+// for trades based on changes in the security's volatility.
+//
 // Calculation:
 //
-//     ATRP = (Average True Range / Close) * 100
+//	ATRP = (Average True Range / Close) * 100
 //
 //go:generate callbackgen -type ATRP
 type ATRP struct {
@@ -61,22 +69,19 @@ func (inc *ATRP) Update(high, low, cloze float64) {
 
 	// apply rolling moving average
 	inc.RMA.Update(trueRange)
-	atr := inc.RMA.Last()
+	atr := inc.RMA.Last(0)
 	inc.PercentageVolatility.Push(atr / cloze)
 }
 
-func (inc *ATRP) Last() float64 {
+func (inc *ATRP) Last(i int) float64 {
 	if inc.RMA == nil {
 		return 0
 	}
-	return inc.RMA.Last()
+	return inc.RMA.Last(i)
 }
 
 func (inc *ATRP) Index(i int) float64 {
-	if inc.RMA == nil {
-		return 0
-	}
-	return inc.RMA.Index(i)
+	return inc.Last(i)
 }
 
 func (inc *ATRP) Length() int {
@@ -101,7 +106,7 @@ func (inc *ATRP) CalculateAndUpdate(kLines []types.KLine) {
 		inc.PushK(k)
 	}
 
-	inc.EmitUpdate(inc.Last())
+	inc.EmitUpdate(inc.Last(0))
 	inc.EndTime = kLines[len(kLines)-1].EndTime.Time()
 }
 

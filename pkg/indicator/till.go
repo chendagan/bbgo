@@ -8,6 +8,15 @@ const defaultVolumeFactor = 0.7
 
 // Refer: Tillson T3 Moving Average
 // Refer URL: https://tradingpedia.com/forex-trading-indicator/t3-moving-average-indicator/
+//
+// The Tillson T3 Moving Average (T3) is a technical analysis indicator that is used to smooth price data and reduce the lag associated
+// with traditional moving averages. It was developed by Tim Tillson and is based on the exponential moving average, with the weighting
+// factors determined using a modified version of the cubic polynomial. The T3 is calculated by taking the weighted moving average of the
+// input data using weighting factors that are based on the standard deviation of the data and the specified length of the moving average.
+// This resulting average is then plotted on the price chart as a line, which can be used to make predictions about future price movements.
+// The T3 is typically more responsive to changes in the underlying data than a simple moving average, but may be less reliable in trending
+// markets.
+
 //go:generate callbackgen -type TILL
 type TILL struct {
 	types.SeriesBase
@@ -48,33 +57,27 @@ func (inc *TILL) Update(value float64) {
 	}
 
 	inc.e1.Update(value)
-	inc.e2.Update(inc.e1.Last())
-	inc.e3.Update(inc.e2.Last())
-	inc.e4.Update(inc.e3.Last())
-	inc.e5.Update(inc.e4.Last())
-	inc.e6.Update(inc.e5.Last())
+	inc.e2.Update(inc.e1.Last(0))
+	inc.e3.Update(inc.e2.Last(0))
+	inc.e4.Update(inc.e3.Last(0))
+	inc.e5.Update(inc.e4.Last(0))
+	inc.e6.Update(inc.e5.Last(0))
 }
 
-func (inc *TILL) Last() float64 {
-	if inc.e1 == nil || inc.e1.Length() == 0 {
-		return 0
-	}
-	e3 := inc.e3.Last()
-	e4 := inc.e4.Last()
-	e5 := inc.e5.Last()
-	e6 := inc.e6.Last()
-	return inc.c1*e6 + inc.c2*e5 + inc.c3*e4 + inc.c4*e3
-}
-
-func (inc *TILL) Index(i int) float64 {
+func (inc *TILL) Last(i int) float64 {
 	if inc.e1 == nil || inc.e1.Length() <= i {
 		return 0
 	}
+
 	e3 := inc.e3.Index(i)
 	e4 := inc.e4.Index(i)
 	e5 := inc.e5.Index(i)
 	e6 := inc.e6.Index(i)
 	return inc.c1*e6 + inc.c2*e5 + inc.c3*e4 + inc.c4*e3
+}
+
+func (inc *TILL) Index(i int) float64 {
+	return inc.Last(i)
 }
 
 func (inc *TILL) Length() int {
@@ -92,7 +95,7 @@ func (inc *TILL) PushK(k types.KLine) {
 	}
 
 	inc.Update(k.Close.Float64())
-	inc.EmitUpdate(inc.Last())
+	inc.EmitUpdate(inc.Last(0))
 }
 
 func (inc *TILL) LoadK(allKLines []types.KLine) {

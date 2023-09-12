@@ -4,17 +4,19 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"github.com/c9s/bbgo/pkg/cmd/cmdutil"
-	"github.com/c9s/bbgo/pkg/data/tsv"
-	"github.com/c9s/bbgo/pkg/util"
-	"github.com/fatih/color"
-	"github.com/google/uuid"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/fatih/color"
+	"github.com/google/uuid"
+
+	"github.com/c9s/bbgo/pkg/cmd/cmdutil"
+	"github.com/c9s/bbgo/pkg/core"
+	"github.com/c9s/bbgo/pkg/data/tsv"
+	"github.com/c9s/bbgo/pkg/util"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -294,8 +296,8 @@ var BacktestCmd = &cobra.Command{
 			return err
 		}
 
-		allKLineIntervals, requiredInterval, backTestIntervals := collectSubscriptionIntervals(environ)
-		exchangeSources, err := toExchangeSources(environ.Sessions(), startTime, endTime, requiredInterval, backTestIntervals...)
+		allKLineIntervals, requiredInterval, backTestIntervals := backtest.CollectSubscriptionIntervals(environ)
+		exchangeSources, err := backtest.InitializeExchangeSources(environ.Sessions(), startTime, endTime, requiredInterval, backTestIntervals...)
 		if err != nil {
 			return err
 		}
@@ -306,16 +308,16 @@ var BacktestCmd = &cobra.Command{
 		var reportDir = outputDirectory
 		var sessionTradeStats = make(map[string]map[string]*types.TradeStats)
 
-		var tradeCollectorList []*bbgo.TradeCollector
+		var tradeCollectorList []*core.TradeCollector
 		for _, exSource := range exchangeSources {
 			sessionName := exSource.Session.Name
 			tradeStatsMap := make(map[string]*types.TradeStats)
 			for usedSymbol := range exSource.Session.Positions() {
 				market, _ := exSource.Session.Market(usedSymbol)
 				position := types.NewPositionFromMarket(market)
-				orderStore := bbgo.NewOrderStore(usedSymbol)
+				orderStore := core.NewOrderStore(usedSymbol)
 				orderStore.AddOrderUpdate = true
-				tradeCollector := bbgo.NewTradeCollector(usedSymbol, position, orderStore)
+				tradeCollector := core.NewTradeCollector(usedSymbol, position, orderStore)
 
 				tradeStats := types.NewTradeStats(usedSymbol)
 				tradeStats.SetIntervalProfitCollector(types.NewIntervalProfitCollector(types.Interval1d, startTime))
@@ -523,8 +525,12 @@ var BacktestCmd = &cobra.Command{
 
 		for _, session := range environ.Sessions() {
 			for symbol, trades := range session.Trades {
-				intervalProfits := sessionTradeStats[session.Name][symbol].IntervalProfits[types.Interval1d]
-				symbolReport, err := createSymbolReport(userConfig, session, symbol, trades.Trades, intervalProfits)
+				tradeState := sessionTradeStats[session.Name][symbol]
+				profitFactor := tradeState.ProfitFactor
+				winningRatio := tradeState.WinningRatio
+				intervalProfits := tradeState.IntervalProfits[types.Interval1d]
+
+				symbolReport, err := createSymbolReport(userConfig, session, symbol, trades.Copy(), intervalProfits, profitFactor, winningRatio)
 				if err != nil {
 					return err
 				}
@@ -589,33 +595,8 @@ var BacktestCmd = &cobra.Command{
 	},
 }
 
-func collectSubscriptionIntervals(environ *bbgo.Environment) (allKLineIntervals map[types.Interval]struct{}, requiredInterval types.Interval, backTestIntervals []types.Interval) {
-	// default extra back-test intervals
-	backTestIntervals = []types.Interval{types.Interval1h, types.Interval1d}
-	// all subscribed intervals
-	allKLineIntervals = make(map[types.Interval]struct{})
-
-	for _, interval := range backTestIntervals {
-		allKLineIntervals[interval] = struct{}{}
-	}
-	// default interval is 1m for all exchanges
-	requiredInterval = types.Interval1m
-	for _, session := range environ.Sessions() {
-		for _, sub := range session.Subscriptions {
-			if sub.Channel == types.KLineChannel {
-				if sub.Options.Interval.Seconds()%60 > 0 {
-					// if any subscription interval is less than 60s, then we will use 1s for back-testing
-					requiredInterval = types.Interval1s
-					log.Warnf("found kline subscription interval less than 60s, modify default backtest interval to 1s")
-				}
-				allKLineIntervals[sub.Options.Interval] = struct{}{}
-			}
-		}
-	}
-	return allKLineIntervals, requiredInterval, backTestIntervals
-}
-
-func createSymbolReport(userConfig *bbgo.Config, session *bbgo.ExchangeSession, symbol string, trades []types.Trade, intervalProfit *types.IntervalProfitCollector) (
+func createSymbolReport(userConfig *bbgo.Config, session *bbgo.ExchangeSession, symbol string, trades []types.Trade, intervalProfit *types.IntervalProfitCollector,
+	profitFactor, winningRatio fixedpoint.Value) (
 	*backtest.SessionSymbolReport,
 	error,
 ) {
@@ -661,8 +642,10 @@ func createSymbolReport(userConfig *bbgo.Config, session *bbgo.ExchangeSession, 
 		InitialBalances: initBalances,
 		FinalBalances:   finalBalances,
 		// Manifests:       manifests,
-		Sharpe:  sharpeRatio,
-		Sortino: sortinoRatio,
+		Sharpe:       sharpeRatio,
+		Sortino:      sortinoRatio,
+		ProfitFactor: profitFactor,
+		WinningRatio: winningRatio,
 	}
 
 	for _, s := range session.Subscriptions {
@@ -715,50 +698,26 @@ func confirmation(s string) bool {
 	}
 }
 
-func toExchangeSources(sessions map[string]*bbgo.ExchangeSession, startTime, endTime time.Time, requiredInterval types.Interval, extraIntervals ...types.Interval) (exchangeSources []*backtest.ExchangeDataSource, err error) {
-	for _, session := range sessions {
-		backtestEx := session.Exchange.(*backtest.Exchange)
-
-		c, err := backtestEx.SubscribeMarketData(startTime, endTime, requiredInterval, extraIntervals...)
-		if err != nil {
-			return exchangeSources, err
-		}
-
-		sessionCopy := session
-		src := &backtest.ExchangeDataSource{
-			C:        c,
-			Exchange: backtestEx,
-			Session:  sessionCopy,
-		}
-		backtestEx.Src = src
-		exchangeSources = append(exchangeSources, src)
+func getExchangeIntervals(ex types.Exchange) types.IntervalMap {
+	exCustom, ok := ex.(types.CustomIntervalProvider)
+	if ok {
+		return exCustom.SupportedInterval()
 	}
-	return exchangeSources, nil
+	return types.SupportedIntervals
 }
 
 func sync(ctx context.Context, userConfig *bbgo.Config, backtestService *service.BacktestService, sourceExchanges map[types.ExchangeName]types.Exchange, syncFrom, syncTo time.Time) error {
 	for _, symbol := range userConfig.Backtest.Symbols {
 		for _, sourceExchange := range sourceExchanges {
-			exCustom, ok := sourceExchange.(types.CustomIntervalProvider)
+			var supportIntervals = getExchangeIntervals(sourceExchange)
 
-			var supportIntervals map[types.Interval]int
-			if ok {
-				supportIntervals = exCustom.SupportedInterval()
-			} else {
-				supportIntervals = types.SupportedIntervals
-			}
 			if !userConfig.Backtest.SyncSecKLines {
 				delete(supportIntervals, types.Interval1s)
 			}
 
 			// sort intervals
-			var intervals []types.Interval
-			for interval := range supportIntervals {
-				intervals = append(intervals, interval)
-			}
-			sort.Slice(intervals, func(i, j int) bool {
-				return intervals[i].Duration() < intervals[j].Duration()
-			})
+			var intervals = supportIntervals.Slice()
+			intervals.Sort()
 
 			for _, interval := range intervals {
 				if err := backtestService.Sync(ctx, sourceExchange, symbol, interval, syncFrom, syncTo); err != nil {

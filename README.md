@@ -1,6 +1,6 @@
 # BBGO
 
-A crypto trading bot framework written in Go. The name bbgo comes from the BB8 bot in the Star Wars movie.
+A modern crypto trading bot framework written in Go.
 
 ## Current Status
 
@@ -90,13 +90,48 @@ the implementation.
 
 ![bbgo backtest report](assets/screenshots/backtest-report.jpg)
 
+## Built-in Strategies
+
+| strategy    | description                                                                                                                             | type       | backtest support |
+|-------------|-----------------------------------------------------------------------------------------------------------------------------------------|------------|------------------|
+| grid        | the first generation grid strategy, it provides more flexibility, but you need to prepare inventories                                   | maker      |                  |
+| grid2       | the second generation grid strategy, it can convert your quote asset into a grid, supports base+quote mode                              | maker      |                  |
+| bollgrid    | strategy implements a basic grid strategy with the built-in bollinger indicator                                                         | maker      |                  | 
+| xmaker      | cross exchange market making strategy, it hedges your inventory risk on the other side                                                  | maker      | no               |
+| xnav        | this strategy helps you record the current net asset value                                                                              | tool       | no               |
+| xalign      | this strategy aligns your balance position automatically                                                                                | tool       | no               |
+| xfunding    | a funding rate fee strategy                                                                                                             | funding    | no               |
+| autoborrow  | this strategy uses margin to borrow assets, to help you keep the minimal balance                                                        | tool       | no               |
+| pivotshort  | this strategy finds the pivot low and entry the trade when the price breaks the previous low                                            | long/short |                  |
+| schedule    | this strategy buy/sell with a fixed quantity periodically, you can use this as a single DCA, or to refill the fee asset like BNB.       | tool       |
+| irr         | this strategy opens the position based on the predicated return rate                                                                    | long/short |                  |
+| bollmaker   | this strategy holds a long-term long/short position, places maker orders on both side, uses bollinger band to control the position size | maker      |                  |
+| wall        | this strategy creates wall (large amount order) on the order book                                                                       | maker      | no               |
+| scmaker     | this market making strategy is desgiend for stable coin markets, like USDC/USDT                                                         | maker      |                  |
+| drift       |                                                                                                                                         | long/short |                  |
+| rsicross    | this strategy opens a long position when the fast rsi cross over the slow rsi, this is a demo strategy for using the v2 indicator       | long/short |                  |
+| marketcap   | this strategy implements a strategy that rebalances the portfolio based on the market capitalization                                    | rebalance  | no               |
+| supertrend  | this strategy uses DEMA and Supertrend indicator to open the long/short position                                                        | long/short |                  |
+| trendtrader | this strategy opens long/short position based on the trendline breakout                                                                 | long/short |                  |
+| elliottwave |                                                                                                                                         | long/short |                  |
+| ewoDgtrd    |                                                                                                                                         | long/short |                  |
+| fixedmaker  |                                                                                                                                         | maker      |                  |
+| factoryzoo  |                                                                                                                                         | long/short |                  |
+| fmaker      |                                                                                                                                         | maker      |                  |
+| linregmaker | a linear regression based market maker                                                                                                  | maker      |                  |
+| convert     | convert strategy is a tool that helps you convert specific asset to a target asset                                                      | tool       | no               |
+
+
+
+
 ## Supported Exchanges
 
 - Binance Spot Exchange (and binance.us)
-- FTX Spot Exchange
 - OKEx Spot Exchange
 - Kucoin Spot Exchange
 - MAX Spot Exchange (located in Taiwan)
+- Bitget Exchange (In Progress)
+- Bybit Exchange (In Progress)
 
 ## Documentation and General Topics
 
@@ -108,7 +143,6 @@ Get your exchange API key and secret after you register the accounts (you can ch
 
 - MAX: <https://max.maicoin.com/signup?r=c7982718>
 - Binance: <https://accounts.binance.com/en/register?ref=38192708>
-- FTX: <https://ftx.com/#a=7710474>
 - OKEx: <https://www.okex.com/join/2412712?src=from:ios-share>
 - Kucoin: <https://www.kucoin.com/ucenter/signup?rcode=r3KX2D4>
 
@@ -178,12 +212,6 @@ BINANCE_US=0
 MAX_API_KEY=
 MAX_API_SECRET=
 
-# for FTX exchange, if you have one
-FTX_API_KEY=
-FTX_API_SECRET=
-# specify it if credentials are for subaccount
-FTX_SUBACCOUNT=
-
 # for OKEx exchange, if you have one
 OKEX_API_KEY=
 OKEX_API_SECRET=
@@ -194,6 +222,10 @@ KUCOIN_API_KEY=
 KUCOIN_API_SECRET=
 KUCOIN_API_PASSPHRASE=
 KUCOIN_API_KEY_VERSION=2
+
+# for Bybit exchange, if you have one
+BYBIT_API_KEY=
+BYBIT_API_SECRET=
 ```
 
 Prepare your dotenv file `.env.local` and BBGO yaml config file `bbgo.yaml`.
@@ -239,6 +271,24 @@ bbgo pnl --exchange binance --asset BTC --since "2019-01-01"
 --->
 
 ## Advanced Configuration
+
+### Synchronize System Time With Binance
+
+BBGO provides the script for UNIX systems/subsystems to synchronize date with Binance. `jq` and `bc` are required to be
+installed in previous.
+To install the dependencies in Ubuntu, try the following commands:
+
+```bash
+sudo apt install -y bc jq
+```
+
+And to synchronize the date, try:
+
+```bash
+sudo ./scripts/sync_time.sh
+```
+
+You could also add the script to crontab so that the system time could get synchronized with Binance regularly.
 
 ### Testnet (Paper Trading)
 
@@ -337,8 +387,6 @@ Check out the strategy directory [strategy](pkg/strategy) for all built-in strat
 
 - `pricealert` strategy demonstrates how to use the notification system [pricealert](pkg/strategy/pricealert). See
   [document](./doc/strategy/pricealert.md).
-- `xpuremaker` strategy demonstrates how to maintain the orderbook and submit maker
-  orders [xpuremaker](pkg/strategy/xpuremaker)
 - `buyandhold` strategy demonstrates how to subscribe kline events and submit market
   order [buyandhold](pkg/strategy/pricedrop)
 - `bollgrid` strategy implements a basic grid strategy with the built-in bollinger
@@ -351,8 +399,12 @@ Check out the strategy directory [strategy](pkg/strategy) for all built-in strat
 - `support` strategy uses K-lines with high volume as support [support](pkg/strategy/support). See
   [document](./doc/strategy/support.md).
 - `flashcrash` strategy implements a strategy that catches the flashcrash [flashcrash](pkg/strategy/flashcrash)
-- `marketcap` strategy implements a strategy that rebalances the portfolio based on the
-  market capitalization [marketcap](pkg/strategy/marketcap). See [document](./doc/strategy/marketcap.md).
+- `marketcap` strategy implements a strategy that rebalances the portfolio based on the market
+  capitalization [marketcap](pkg/strategy/marketcap). See [document](./doc/strategy/marketcap.md).
+- `pivotshort` - shorting focused strategy.
+- `irr` - return rate strategy.
+- `drift` - drift strategy.
+- `grid2` - the second-generation grid strategy.
 
 To run these built-in strategies, just modify the config file to make the configuration suitable for you, for example if
 you want to run
@@ -432,6 +484,7 @@ See also:
 - <https://github.com/narumiruna/bbgo-marketcap>
 - <https://github.com/austin362667/shadow>
 - <https://github.com/jnlin/bbgo-strategy-infinite-grid>
+- <https://github.com/yubing744/trading-gpt>
 
 ## Command Usages
 
@@ -445,7 +498,6 @@ bbgo submit-order --session=okex --symbol=OKBUSDT --side=buy --price=10.0 --quan
 
 ```sh
 bbgo list-orders open --session=okex --symbol=OKBUSDT
-bbgo list-orders open --session=ftx --symbol=FTTUSDT
 bbgo list-orders open --session=max --symbol=MAXUSDT
 bbgo list-orders open --session=binance --symbol=BNBUSDT
 ```

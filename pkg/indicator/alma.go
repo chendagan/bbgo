@@ -10,8 +10,17 @@ import (
 // Refer: Arnaud Legoux Moving Average
 // Refer: https://capital.com/arnaud-legoux-moving-average
 // Also check https://github.com/DaveSkender/Stock.Indicators/blob/main/src/a-d/Alma/Alma.cs
+//
+// The Arnaud Legoux Moving Average (ALMA) is a technical analysis indicator that is used to smooth price data and reduce the lag associated
+// with traditional moving averages. It was developed by Arnaud Legoux and is based on the weighted moving average, with the weighting factors
+// determined using a Gaussian function. The ALMA is calculated by taking the weighted moving average of the input data using weighting factors
+// that are based on the standard deviation of the data and the specified length of the moving average. This resulting average is then plotted
+// on the price chart as a line, which can be used to make predictions about future price movements. The ALMA is typically more responsive to
+// changes in the underlying data than a simple moving average, but may be less reliable in trending markets.
+//
 // @param offset: Gaussian applied to the combo line. 1->ema, 0->sma
 // @param sigma: the standard deviation applied to the combo line. This makes the combo line sharper
+//
 //go:generate callbackgen -type ALMA
 type ALMA struct {
 	types.SeriesBase
@@ -20,9 +29,9 @@ type ALMA struct {
 	Sigma                int     // required: recommend to be 5
 	weight               []float64
 	sum                  float64
-	input           []float64
-	Values          floats.Slice
-	UpdateCallbacks []func(value float64)
+	input                []float64
+	Values               floats.Slice
+	UpdateCallbacks      []func(value float64)
 }
 
 const MaxNumOfALMA = 5_000
@@ -56,18 +65,12 @@ func (inc *ALMA) Update(value float64) {
 	}
 }
 
-func (inc *ALMA) Last() float64 {
-	if len(inc.Values) == 0 {
-		return 0
-	}
-	return inc.Values[len(inc.Values)-1]
+func (inc *ALMA) Last(i int) float64 {
+	return inc.Values.Last(i)
 }
 
 func (inc *ALMA) Index(i int) float64 {
-	if i >= len(inc.Values) {
-		return 0
-	}
-	return inc.Values[len(inc.Values)-i-1]
+	return inc.Last(i)
 }
 
 func (inc *ALMA) Length() int {
@@ -80,21 +83,10 @@ func (inc *ALMA) CalculateAndUpdate(allKLines []types.KLine) {
 	if inc.input == nil {
 		for _, k := range allKLines {
 			inc.Update(k.Close.Float64())
-			inc.EmitUpdate(inc.Last())
+			inc.EmitUpdate(inc.Last(0))
 		}
 		return
 	}
 	inc.Update(allKLines[len(allKLines)-1].Close.Float64())
-	inc.EmitUpdate(inc.Last())
-}
-
-func (inc *ALMA) handleKLineWindowUpdate(interval types.Interval, window types.KLineWindow) {
-	if inc.Interval != interval {
-		return
-	}
-	inc.CalculateAndUpdate(window)
-}
-
-func (inc *ALMA) Bind(updater KLineWindowUpdater) {
-	updater.OnKLineWindowUpdate(inc.handleKLineWindowUpdate)
+	inc.EmitUpdate(inc.Last(0))
 }

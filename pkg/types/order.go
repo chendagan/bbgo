@@ -20,6 +20,13 @@ func init() {
 	_ = PlainText(&Order{})
 }
 
+type CancelReplaceModeType string
+
+var (
+	StopOnFailure CancelReplaceModeType = "STOP_ON_FAILURE"
+	AllowFailure  CancelReplaceModeType = "ALLOW_FAILURE"
+)
+
 type TimeInForce string
 
 var (
@@ -109,8 +116,14 @@ const (
 	OrderStatusRejected OrderStatus = "REJECTED"
 )
 
+func (o OrderStatus) Closed() bool {
+	return o == OrderStatusFilled ||
+		o == OrderStatusCanceled ||
+		o == OrderStatusRejected
+}
+
 type SubmitOrder struct {
-	ClientOrderID string `json:"clientOrderID" db:"client_order_id"`
+	ClientOrderID string `json:"clientOrderID,omitempty" db:"client_order_id"`
 
 	Symbol string    `json:"symbol" db:"symbol"`
 	Side   SideType  `json:"side" db:"side"`
@@ -120,7 +133,7 @@ type SubmitOrder struct {
 	Price    fixedpoint.Value `json:"price" db:"price"`
 
 	// AveragePrice is only used in back-test currently
-	AveragePrice fixedpoint.Value `json:"averagePrice"`
+	AveragePrice fixedpoint.Value `json:"averagePrice,omitempty"`
 
 	StopPrice fixedpoint.Value `json:"stopPrice,omitempty" db:"stop_price"`
 
@@ -132,10 +145,10 @@ type SubmitOrder struct {
 
 	MarginSideEffect MarginOrderSideEffectType `json:"marginSideEffect,omitempty"` // AUTO_REPAY = repay, MARGIN_BUY = borrow, defaults to  NO_SIDE_EFFECT
 
-	ReduceOnly    bool `json:"reduceOnly" db:"reduce_only"`
-	ClosePosition bool `json:"closePosition" db:"close_position"`
+	ReduceOnly    bool `json:"reduceOnly,omitempty" db:"reduce_only"`
+	ClosePosition bool `json:"closePosition,omitempty" db:"close_position"`
 
-	Tag string `json:"tag" db:"-"`
+	Tag string `json:"tag,omitempty" db:"-"`
 }
 
 func (o *SubmitOrder) In() (fixedpoint.Value, string) {
@@ -241,7 +254,7 @@ type Order struct {
 	Exchange ExchangeName `json:"exchange" db:"exchange"`
 
 	// GID is used for relational database storage, it's an incremental ID
-	GID     uint64 `json:"gid" db:"gid"`
+	GID     uint64 `json:"gid,omitempty" db:"gid"`
 	OrderID uint64 `json:"orderID" db:"order_id"` // order id
 	UUID    string `json:"uuid,omitempty"`
 
@@ -251,9 +264,9 @@ type Order struct {
 	CreationTime     Time             `json:"creationTime" db:"created_at"`
 	UpdateTime       Time             `json:"updateTime" db:"updated_at"`
 
-	IsFutures  bool `json:"isFutures" db:"is_futures"`
-	IsMargin   bool `json:"isMargin" db:"is_margin"`
-	IsIsolated bool `json:"isIsolated" db:"is_isolated"`
+	IsFutures  bool `json:"isFutures,omitempty" db:"is_futures"`
+	IsMargin   bool `json:"isMargin,omitempty" db:"is_margin"`
+	IsIsolated bool `json:"isIsolated,omitempty" db:"is_isolated"`
 }
 
 func (o Order) CsvHeader() []string {
@@ -309,7 +322,7 @@ func (o Order) String() string {
 
 	desc := fmt.Sprintf("ORDER %s | %s | %s | %s | %s %-4s | %s/%s @ %s",
 		o.Exchange.String(),
-		o.CreationTime.Time().Local().Format(time.RFC1123),
+		o.CreationTime.Time().Local().Format(time.StampMilli),
 		orderID,
 		o.Symbol,
 		o.Type,
@@ -386,4 +399,45 @@ func (o Order) SlackAttachment() slack.Attachment {
 		FooterIcon: footerIcon,
 		Footer:     strings.ToLower(o.Exchange.String()) + templateutil.Render(" creation time {{ . }}", o.CreationTime.Time().Format(time.StampMilli)),
 	}
+}
+
+func OrdersFilter(in []Order, f func(o Order) bool) (out []Order) {
+	for _, o := range in {
+		if f(o) {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+func OrdersActive(in []Order) []Order {
+	return OrdersFilter(in, IsActiveOrder)
+}
+
+func OrdersFilled(in []Order) (out []Order) {
+	return OrdersFilter(in, func(o Order) bool {
+		return o.Status == OrderStatusFilled
+	})
+}
+
+func OrdersAll(orders []Order, f func(o Order) bool) bool {
+	for _, o := range orders {
+		if !f(o) {
+			return false
+		}
+	}
+	return true
+}
+
+func OrdersAny(orders []Order, f func(o Order) bool) bool {
+	for _, o := range orders {
+		if f(o) {
+			return true
+		}
+	}
+	return false
+}
+
+func IsActiveOrder(o Order) bool {
+	return o.Status == OrderStatusNew || o.Status == OrderStatusPartiallyFilled
 }

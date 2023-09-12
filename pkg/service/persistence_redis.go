@@ -6,13 +6,19 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/go-redis/redis/v8"
 	log "github.com/sirupsen/logrus"
 )
 
+var redisLogger = log.WithFields(log.Fields{
+	"persistence": "redis",
+})
+
 type RedisPersistenceService struct {
-	redis *redis.Client
+	redis  *redis.Client
+	config *RedisPersistenceConfig
 }
 
 func NewRedisPersistenceService(config *RedisPersistenceConfig) *RedisPersistenceService {
@@ -25,13 +31,18 @@ func NewRedisPersistenceService(config *RedisPersistenceConfig) *RedisPersistenc
 	})
 
 	return &RedisPersistenceService{
-		redis: client,
+		redis:  client,
+		config: config,
 	}
 }
 
 func (s *RedisPersistenceService) NewStore(id string, subIDs ...string) Store {
 	if len(subIDs) > 0 {
 		id += ":" + strings.Join(subIDs, ":")
+	}
+
+	if s.config != nil && s.config.Namespace != "" {
+		id = s.config.Namespace + ":" + id
 	}
 
 	return &RedisStore{
@@ -54,7 +65,7 @@ func (store *RedisStore) Load(val interface{}) error {
 	cmd := store.redis.Get(context.Background(), store.ID)
 	data, err := cmd.Result()
 
-	log.Debugf("[redis] get key %q, data = %s", store.ID, string(data))
+	redisLogger.Debugf("[redis] get key %q, data = %s", store.ID, string(data))
 
 	if err != nil {
 		if err == redis.Nil {
@@ -77,15 +88,20 @@ func (store *RedisStore) Save(val interface{}) error {
 		return nil
 	}
 
+	var expiration time.Duration
+	if expiringData, ok := val.(Expirable); ok {
+		expiration = expiringData.Expiration()
+	}
+
 	data, err := json.Marshal(val)
 	if err != nil {
 		return err
 	}
 
-	cmd := store.redis.Set(context.Background(), store.ID, data, 0)
+	cmd := store.redis.Set(context.Background(), store.ID, data, expiration)
 	_, err = cmd.Result()
 
-	log.Debugf("[redis] set key %q, data = %s", store.ID, string(data))
+	redisLogger.Debugf("[redis] set key %q, data = %s, expiration = %s", store.ID, string(data), expiration)
 
 	return err
 }

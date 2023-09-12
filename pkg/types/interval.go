@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -25,8 +26,42 @@ func (i Interval) Seconds() int {
 	return m
 }
 
+// Milliseconds is specially handled, for better precision
+// for ms level interval, calling Seconds and Minutes directly might trigger panic error
+func (i Interval) Milliseconds() int {
+	t := 0
+	index := 0
+	for i, rn := range string(i) {
+		if rn >= '0' && rn <= '9' {
+			t = t*10 + int(rn-'0')
+		} else {
+			index = i
+			break
+		}
+	}
+	switch strings.ToLower(string(i[index:])) {
+	case "ms":
+		return t
+	case "s":
+		return t * 1000
+	case "m":
+		t *= 60
+	case "h":
+		t *= 60 * 60
+	case "d":
+		t *= 60 * 60 * 24
+	case "w":
+		t *= 60 * 60 * 24 * 7
+	case "mo":
+		t *= 60 * 60 * 24 * 30
+	default:
+		panic("unknown interval input: " + i)
+	}
+	return t * 1000
+}
+
 func (i Interval) Duration() time.Duration {
-	return time.Duration(i.Seconds()) * time.Second
+	return time.Duration(i.Milliseconds()) * time.Millisecond
 }
 
 func (i *Interval) UnmarshalJSON(b []byte) (err error) {
@@ -45,6 +80,12 @@ func (i Interval) String() string {
 }
 
 type IntervalSlice []Interval
+
+func (s IntervalSlice) Sort() {
+	sort.Slice(s, func(i, j int) bool {
+		return s[i].Duration() < s[j].Duration()
+	})
+}
 
 func (s IntervalSlice) StringSlice() (slice []string) {
 	for _, interval := range s {
@@ -100,7 +141,17 @@ func ParseInterval(input Interval) int {
 	return t
 }
 
-var SupportedIntervals = map[Interval]int{
+type IntervalMap map[Interval]int
+
+func (m IntervalMap) Slice() (slice IntervalSlice) {
+	for interval := range m {
+		slice = append(slice, interval)
+	}
+
+	return slice
+}
+
+var SupportedIntervals = IntervalMap{
 	Interval1s:  1,
 	Interval1m:  1 * 60,
 	Interval3m:  3 * 60,

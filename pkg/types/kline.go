@@ -10,13 +10,14 @@ import (
 	"github.com/c9s/bbgo/pkg/style"
 )
 
+var Two = fixedpoint.NewFromInt(2)
+var Three = fixedpoint.NewFromInt(3)
+
 type Direction int
 
 const DirectionUp = 1
 const DirectionNone = 0
 const DirectionDown = -1
-
-var Two = fixedpoint.NewFromInt(2)
 
 type KLineOrWindow interface {
 	GetInterval() string
@@ -544,7 +545,7 @@ func (k KLineWindow) SlackAttachment() slack.Attachment {
 	}
 }
 
-type KLineCallback func(kline KLine)
+type KLineCallback func(k KLine)
 
 type KValueType int
 
@@ -597,26 +598,11 @@ type KLineSeries struct {
 	kv    KValueType
 }
 
-func (k *KLineSeries) Last() float64 {
-	length := len(*k.lines)
-	switch k.kv {
-	case kOpUnknown:
-		panic("kline series operator unknown")
-	case kOpenValue:
-		return (*k.lines)[length-1].GetOpen().Float64()
-	case kCloseValue:
-		return (*k.lines)[length-1].GetClose().Float64()
-	case kLowValue:
-		return (*k.lines)[length-1].GetLow().Float64()
-	case kHighValue:
-		return (*k.lines)[length-1].GetHigh().Float64()
-	case kVolumeValue:
-		return (*k.lines)[length-1].Volume.Float64()
-	}
-	return 0
+func (k *KLineSeries) Index(i int) float64 {
+	return k.Last(i)
 }
 
-func (k *KLineSeries) Index(i int) float64 {
+func (k *KLineSeries) Last(i int) float64 {
 	length := len(*k.lines)
 	if length == 0 || length-i-1 < 0 {
 		return 0
@@ -642,13 +628,63 @@ func (k *KLineSeries) Length() int {
 
 var _ Series = &KLineSeries{}
 
-type KLineCallBack func(k KLine)
+func TradeWith(symbol string, f func(trade Trade)) func(trade Trade) {
+	return func(trade Trade) {
+		if symbol != "" && trade.Symbol != symbol {
+			return
+		}
 
-func KLineWith(symbol string, interval Interval, callback KLineCallBack) KLineCallBack {
+		f(trade)
+	}
+}
+
+func KLineWith(symbol string, interval Interval, callback KLineCallback) KLineCallback {
 	return func(k KLine) {
 		if k.Symbol != symbol || (k.Interval != "" && k.Interval != interval) {
 			return
 		}
 		callback(k)
 	}
+}
+
+type KLineValueMapper func(k KLine) float64
+
+func KLineOpenPriceMapper(k KLine) float64 {
+	return k.Open.Float64()
+}
+
+func KLineClosePriceMapper(k KLine) float64 {
+	return k.Close.Float64()
+}
+
+func KLineTypicalPriceMapper(k KLine) float64 {
+	return (k.High.Float64() + k.Low.Float64() + k.Close.Float64()) / 3.
+}
+
+func KLinePriceVolumeMapper(k KLine) float64 {
+	return k.Close.Mul(k.Volume).Float64()
+}
+
+func KLineVolumeMapper(k KLine) float64 {
+	return k.Volume.Float64()
+}
+
+func KLineHLC3Mapper(k KLine) float64 {
+	return k.High.Add(k.Low).Add(k.Close).Div(Three).Float64()
+}
+
+func MapKLinePrice(kLines []KLine, f KLineValueMapper) (prices []float64) {
+	for _, k := range kLines {
+		prices = append(prices, f(k))
+	}
+
+	return prices
+}
+
+func KLineLowPriceMapper(k KLine) float64 {
+	return k.Low.Float64()
+}
+
+func KLineHighPriceMapper(k KLine) float64 {
+	return k.High.Float64()
 }

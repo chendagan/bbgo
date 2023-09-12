@@ -56,11 +56,11 @@ func init() {
 	_ = types.FuturesExchange(&Exchange{})
 
 	if n, ok := util.GetEnvVarInt("BINANCE_ORDER_RATE_LIMITER"); ok {
-		orderLimiter = rate.NewLimiter(rate.Limit(n), 2)
+		orderLimiter = rate.NewLimiter(rate.Every(time.Duration(n)*time.Minute), 2)
 	}
 
 	if n, ok := util.GetEnvVarInt("BINANCE_QUERY_TRADES_RATE_LIMITER"); ok {
-		queryTradeLimiter = rate.NewLimiter(rate.Limit(n), 2)
+		queryTradeLimiter = rate.NewLimiter(rate.Every(time.Duration(n)*time.Minute), 2)
 	}
 }
 
@@ -88,6 +88,8 @@ type Exchange struct {
 
 	// client2 is a newer version of the binance api client implemented by ourselves.
 	client2 *binanceapi.RestClient
+
+	futuresClient2 *binanceapi.FuturesRestClient
 }
 
 var timeSetterOnce sync.Once
@@ -111,17 +113,20 @@ func New(key, secret string) *Exchange {
 	}
 
 	client2 := binanceapi.NewClient(client.BaseURL)
+	futuresClient2 := binanceapi.NewFuturesRestClient(futuresClient.BaseURL)
 
 	ex := &Exchange{
-		key:           key,
-		secret:        secret,
-		client:        client,
-		futuresClient: futuresClient,
-		client2:       client2,
+		key:            key,
+		secret:         secret,
+		client:         client,
+		futuresClient:  futuresClient,
+		client2:        client2,
+		futuresClient2: futuresClient2,
 	}
 
 	if len(key) > 0 && len(secret) > 0 {
 		client2.Auth(key, secret)
+		futuresClient2.Auth(key, secret)
 
 		ctx := context.Background()
 		go timeSetterOnce.Do(func() {
@@ -367,24 +372,56 @@ func (e *Exchange) QueryMarginBorrowHistory(ctx context.Context, asset string) e
 	return nil
 }
 
+// TransferMarginAccountAsset transfers the asset into/out from the margin account
+//
+// types.TransferIn => Spot to Margin
+// types.TransferOut => Margin to Spot
+//
+// to call this method, you must set the IsMargin = true
+func (e *Exchange) TransferMarginAccountAsset(ctx context.Context, asset string, amount fixedpoint.Value, io types.TransferDirection) error {
+	if e.IsIsolatedMargin {
+		return e.transferIsolatedMarginAccountAsset(ctx, asset, amount, io)
+	}
+
+	return e.transferCrossMarginAccountAsset(ctx, asset, amount, io)
+}
+
+func (e *Exchange) transferIsolatedMarginAccountAsset(ctx context.Context, asset string, amount fixedpoint.Value, io types.TransferDirection) error {
+	req := e.client2.NewTransferIsolatedMarginAccountRequest()
+	req.Symbol(e.IsolatedMarginSymbol)
+
+	switch io {
+	case types.TransferIn:
+		req.TransFrom(binanceapi.AccountTypeSpot)
+		req.TransTo(binanceapi.AccountTypeIsolatedMargin)
+
+	case types.TransferOut:
+		req.TransFrom(binanceapi.AccountTypeIsolatedMargin)
+		req.TransTo(binanceapi.AccountTypeSpot)
+	}
+
+	req.Asset(asset)
+	req.Amount(amount.String())
+	resp, err := req.Do(ctx)
+	return logResponse(resp, err, req)
+}
+
 // transferCrossMarginAccountAsset transfer asset to the cross margin account or to the main account
-func (e *Exchange) transferCrossMarginAccountAsset(ctx context.Context, asset string, amount fixedpoint.Value, io int) error {
-	req := e.client.NewMarginTransferService()
+func (e *Exchange) transferCrossMarginAccountAsset(ctx context.Context, asset string, amount fixedpoint.Value, io types.TransferDirection) error {
+	req := e.client2.NewTransferCrossMarginAccountRequest()
 	req.Asset(asset)
 	req.Amount(amount.String())
 
-	if io > 0 { // in
-		req.Type(binance.MarginTransferTypeToMargin)
-	} else if io < 0 { // out
-		req.Type(binance.MarginTransferTypeToMain)
-	}
-	resp, err := req.Do(ctx)
-	if err != nil {
-		return err
+	if io == types.TransferIn {
+		req.TransferType(int(binance.MarginTransferTypeToMargin))
+	} else if io == types.TransferOut {
+		req.TransferType(int(binance.MarginTransferTypeToMain))
+	} else {
+		return fmt.Errorf("unexpected transfer direction: %d given", io)
 	}
 
-	log.Debugf("cross margin transfer %f %s, transaction id = %d", amount.Float64(), asset, resp.TranID)
-	return err
+	resp, err := req.Do(ctx)
+	return logResponse(resp, err, req)
 }
 
 func (e *Exchange) QueryCrossMarginAccount(ctx context.Context) (*types.Account, error) {
@@ -554,8 +591,7 @@ func (e *Exchange) QueryWithdrawHistory(ctx context.Context, asset string, since
 }
 
 func (e *Exchange) QueryDepositHistory(ctx context.Context, asset string, since, until time.Time) (allDeposits []types.Deposit, err error) {
-	var emptyTime = time.Time{}
-	if since == emptyTime {
+	if since.IsZero() {
 		since, err = getLaunchDate()
 		if err != nil {
 			return nil, err
@@ -585,13 +621,16 @@ func (e *Exchange) QueryDepositHistory(ctx context.Context, asset string, since,
 		// 0(0:pending,6: credited but cannot withdraw, 1:success)
 		// set the default status
 		status := types.DepositStatus(fmt.Sprintf("code: %d", d.Status))
+
+		// https://www.binance.com/en/support/faq/115003736451
 		switch d.Status {
-		case 0:
+		case binanceapi.DepositStatusPending:
 			status = types.DepositPending
-		case 6:
-			// https://www.binance.com/en/support/faq/115003736451
+
+		case binanceapi.DepositStatusCredited:
 			status = types.DepositCredited
-		case 1:
+
+		case binanceapi.DepositStatusSuccess:
 			status = types.DepositSuccess
 		}
 
@@ -604,6 +643,8 @@ func (e *Exchange) QueryDepositHistory(ctx context.Context, asset string, since,
 			AddressTag:    d.AddressTag,
 			TransactionID: d.TxId,
 			Status:        status,
+			UnlockConfirm: d.UnlockConfirm,
+			Confirmation:  d.ConfirmTimes,
 		})
 	}
 
@@ -643,42 +684,6 @@ func (e *Exchange) QuerySpotAccount(ctx context.Context) (*types.Account, error)
 		CanDeposit:  account.CanDeposit,  // if can transfer in asset
 		CanTrade:    account.CanTrade,    // if can trade
 		CanWithdraw: account.CanWithdraw, // if can transfer out asset
-	}
-	a.UpdateBalances(balances)
-	return a, nil
-}
-
-// QueryFuturesAccount gets the futures account balances from Binance
-// Balance.Available = Wallet Balance(in Binance UI) - Used Margin
-// Balance.Locked = Used Margin
-func (e *Exchange) QueryFuturesAccount(ctx context.Context) (*types.Account, error) {
-	account, err := e.futuresClient.NewGetAccountService().Do(ctx)
-	if err != nil {
-		return nil, err
-	}
-	accountBalances, err := e.futuresClient.NewGetBalanceService().Do(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var balances = map[string]types.Balance{}
-	for _, b := range accountBalances {
-		balanceAvailable := fixedpoint.Must(fixedpoint.NewFromString(b.AvailableBalance))
-		balanceTotal := fixedpoint.Must(fixedpoint.NewFromString(b.Balance))
-		unrealizedPnl := fixedpoint.Must(fixedpoint.NewFromString(b.CrossUnPnl))
-		balances[b.Asset] = types.Balance{
-			Currency:  b.Asset,
-			Available: balanceAvailable,
-			Locked:    balanceTotal.Sub(balanceAvailable.Sub(unrealizedPnl)),
-		}
-	}
-
-	a := &types.Account{
-		AccountType: types.AccountTypeFutures,
-		FuturesInfo: toGlobalFuturesAccountInfo(account), // In binance GO api, Account define account info which mantain []*AccountAsset and []*AccountPosition.
-		CanDeposit:  account.CanDeposit,                  // if can transfer in asset
-		CanTrade:    account.CanTrade,                    // if can trade
-		CanWithdraw: account.CanWithdraw,                 // if can transfer out asset
 	}
 	a.UpdateBalances(balances)
 	return a, nil
@@ -792,8 +797,9 @@ func (e *Exchange) QueryClosedOrders(ctx context.Context, symbol string, since, 
 		}
 	*/
 
-	if err := orderLimiter.Wait(ctx); err != nil {
+	if err = orderLimiter.Wait(ctx); err != nil {
 		log.WithError(err).Errorf("order rate limiter wait error")
+		return nil, err
 	}
 
 	log.Infof("querying closed orders %s from %s <=> %s ...", symbol, since, until)
@@ -820,22 +826,7 @@ func (e *Exchange) QueryClosedOrders(ctx context.Context, symbol string, since, 
 	}
 
 	if e.IsFutures {
-		req := e.futuresClient.NewListOrdersService().Symbol(symbol)
-
-		if lastOrderID > 0 {
-			req.OrderID(int64(lastOrderID))
-		} else {
-			req.StartTime(since.UnixNano() / int64(time.Millisecond))
-			if until.Sub(since) < 24*time.Hour {
-				req.EndTime(until.UnixNano() / int64(time.Millisecond))
-			}
-		}
-
-		binanceOrders, err := req.Do(ctx)
-		if err != nil {
-			return orders, err
-		}
-		return toGlobalFuturesOrders(binanceOrders, false)
+		return e.queryFuturesClosedOrders(ctx, symbol, since, until, lastOrderID)
 	}
 
 	// If orderId is set, it will get orders >= that orderId. Otherwise most recent orders are returned.
@@ -865,33 +856,13 @@ func (e *Exchange) QueryClosedOrders(ctx context.Context, symbol string, since, 
 }
 
 func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err error) {
-	if err := orderLimiter.Wait(ctx); err != nil {
+	if err = orderLimiter.Wait(ctx); err != nil {
 		log.WithError(err).Errorf("order rate limiter wait error")
+		return err
 	}
 
 	if e.IsFutures {
-		for _, o := range orders {
-			var req = e.futuresClient.NewCancelOrderService()
-
-			// Mandatory
-			req.Symbol(o.Symbol)
-
-			if o.OrderID > 0 {
-				req.OrderID(int64(o.OrderID))
-			} else {
-				err = multierr.Append(err, types.NewOrderError(
-					fmt.Errorf("can not cancel %s order, order does not contain orderID or clientOrderID", o.Symbol),
-					o))
-				continue
-			}
-
-			_, err2 := req.Do(ctx)
-			if err2 != nil {
-				err = multierr.Append(err, types.NewOrderError(err2, o))
-			}
-		}
-
-		return err
+		return e.cancelFuturesOrders(ctx, orders...)
 	}
 
 	for _, o := range orders {
@@ -1036,91 +1007,6 @@ func (e *Exchange) submitMarginOrder(ctx context.Context, order types.SubmitOrde
 	return createdOrder, err
 }
 
-func (e *Exchange) submitFuturesOrder(ctx context.Context, order types.SubmitOrder) (*types.Order, error) {
-	orderType, err := toLocalFuturesOrderType(order.Type)
-	if err != nil {
-		return nil, err
-	}
-
-	req := e.futuresClient.NewCreateOrderService().
-		Symbol(order.Symbol).
-		Type(orderType).
-		Side(futures.SideType(order.Side)).
-		ReduceOnly(order.ReduceOnly)
-
-	clientOrderID := newFuturesClientOrderID(order.ClientOrderID)
-	if len(clientOrderID) > 0 {
-		req.NewClientOrderID(clientOrderID)
-	}
-
-	// use response result format
-	req.NewOrderResponseType(futures.NewOrderRespTypeRESULT)
-
-	if order.Market.Symbol != "" {
-		req.Quantity(order.Market.FormatQuantity(order.Quantity))
-	} else {
-		// TODO report error
-		req.Quantity(order.Quantity.FormatString(8))
-	}
-
-	// set price field for limit orders
-	switch order.Type {
-	case types.OrderTypeStopLimit, types.OrderTypeLimit, types.OrderTypeLimitMaker:
-		if order.Market.Symbol != "" {
-			req.Price(order.Market.FormatPrice(order.Price))
-		} else {
-			// TODO report error
-			req.Price(order.Price.FormatString(8))
-		}
-	}
-
-	// set stop price
-	switch order.Type {
-
-	case types.OrderTypeStopLimit, types.OrderTypeStopMarket:
-		if order.Market.Symbol != "" {
-			req.StopPrice(order.Market.FormatPrice(order.StopPrice))
-		} else {
-			// TODO report error
-			req.StopPrice(order.StopPrice.FormatString(8))
-		}
-	}
-
-	// could be IOC or FOK
-	if len(order.TimeInForce) > 0 {
-		// TODO: check the TimeInForce value
-		req.TimeInForce(futures.TimeInForceType(order.TimeInForce))
-	} else {
-		switch order.Type {
-		case types.OrderTypeLimit, types.OrderTypeLimitMaker, types.OrderTypeStopLimit:
-			req.TimeInForce(futures.TimeInForceTypeGTC)
-		}
-	}
-
-	response, err := req.Do(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Infof("futures order creation response: %+v", response)
-
-	createdOrder, err := toGlobalFuturesOrder(&futures.Order{
-		Symbol:           response.Symbol,
-		OrderID:          response.OrderID,
-		ClientOrderID:    response.ClientOrderID,
-		Price:            response.Price,
-		OrigQuantity:     response.OrigQuantity,
-		ExecutedQuantity: response.ExecutedQuantity,
-		Status:           response.Status,
-		TimeInForce:      response.TimeInForce,
-		Type:             response.Type,
-		Side:             response.Side,
-		ReduceOnly:       response.ReduceOnly,
-	}, false)
-
-	return createdOrder, err
-}
-
 // BBGO is a broker on Binance
 const spotBrokerID = "NSUYEBKM"
 
@@ -1130,36 +1016,6 @@ func newSpotClientOrderID(originalID string) (clientOrderID string) {
 	}
 
 	prefix := "x-" + spotBrokerID
-	prefixLen := len(prefix)
-
-	if originalID != "" {
-		// try to keep the whole original client order ID if user specifies it.
-		if prefixLen+len(originalID) > 32 {
-			return originalID
-		}
-
-		clientOrderID = prefix + originalID
-		return clientOrderID
-	}
-
-	clientOrderID = uuid.New().String()
-	clientOrderID = prefix + clientOrderID
-	if len(clientOrderID) > 32 {
-		return clientOrderID[0:32]
-	}
-
-	return clientOrderID
-}
-
-// BBGO is a futures broker on Binance
-const futuresBrokerID = "gBhMvywy"
-
-func newFuturesClientOrderID(originalID string) (clientOrderID string) {
-	if originalID == types.NoClientOrderID {
-		return ""
-	}
-
-	prefix := "x-" + futuresBrokerID
 	prefixLen := len(prefix)
 
 	if originalID != "" {
@@ -1265,8 +1121,9 @@ func (e *Exchange) submitSpotOrder(ctx context.Context, order types.SubmitOrder)
 }
 
 func (e *Exchange) SubmitOrder(ctx context.Context, order types.SubmitOrder) (createdOrder *types.Order, err error) {
-	if err := orderLimiter.Wait(ctx); err != nil {
+	if err = orderLimiter.Wait(ctx); err != nil {
 		log.WithError(err).Errorf("order rate limiter wait error")
+		return nil, err
 	}
 
 	if e.IsMargin {
@@ -1347,60 +1204,6 @@ func (e *Exchange) QueryKLines(ctx context.Context, symbol string, interval type
 	return kLines, nil
 }
 
-func (e *Exchange) QueryFuturesKLines(ctx context.Context, symbol string, interval types.Interval, options types.KLineQueryOptions) ([]types.KLine, error) {
-
-	var limit = 1000
-	if options.Limit > 0 {
-		// default limit == 1000
-		limit = options.Limit
-	}
-
-	log.Infof("querying kline %s %s %v", symbol, interval, options)
-
-	req := e.futuresClient.NewKlinesService().
-		Symbol(symbol).
-		Interval(string(interval)).
-		Limit(limit)
-
-	if options.StartTime != nil {
-		req.StartTime(options.StartTime.UnixMilli())
-	}
-
-	if options.EndTime != nil {
-		req.EndTime(options.EndTime.UnixMilli())
-	}
-
-	resp, err := req.Do(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var kLines []types.KLine
-	for _, k := range resp {
-		kLines = append(kLines, types.KLine{
-			Exchange:                 types.ExchangeBinance,
-			Symbol:                   symbol,
-			Interval:                 interval,
-			StartTime:                types.NewTimeFromUnix(0, k.OpenTime*int64(time.Millisecond)),
-			EndTime:                  types.NewTimeFromUnix(0, k.CloseTime*int64(time.Millisecond)),
-			Open:                     fixedpoint.MustNewFromString(k.Open),
-			Close:                    fixedpoint.MustNewFromString(k.Close),
-			High:                     fixedpoint.MustNewFromString(k.High),
-			Low:                      fixedpoint.MustNewFromString(k.Low),
-			Volume:                   fixedpoint.MustNewFromString(k.Volume),
-			QuoteVolume:              fixedpoint.MustNewFromString(k.QuoteAssetVolume),
-			TakerBuyBaseAssetVolume:  fixedpoint.MustNewFromString(k.TakerBuyBaseAssetVolume),
-			TakerBuyQuoteAssetVolume: fixedpoint.MustNewFromString(k.TakerBuyQuoteAssetVolume),
-			LastTradeID:              0,
-			NumberOfTrades:           uint64(k.TradeNum),
-			Closed:                   true,
-		})
-	}
-
-	kLines = types.SortKLinesAscending(kLines)
-	return kLines, nil
-}
-
 func (e *Exchange) queryMarginTrades(ctx context.Context, symbol string, options *types.TradeQueryOptions) (trades []types.Trade, err error) {
 	var remoteTrades []*binance.TradeV3
 	req := e.client.NewListMarginTradesService().
@@ -1413,22 +1216,23 @@ func (e *Exchange) queryMarginTrades(ctx context.Context, symbol string, options
 		req.Limit(1000)
 	}
 
+	// BINANCE seems to have an API bug, we can't use both fromId and the start time/end time
 	// BINANCE uses inclusive last trade ID
 	if options.LastTradeID > 0 {
 		req.FromID(int64(options.LastTradeID))
-	}
-
-	if options.StartTime != nil && options.EndTime != nil {
-		if options.EndTime.Sub(*options.StartTime) < 24*time.Hour {
+	} else {
+		if options.StartTime != nil && options.EndTime != nil {
+			if options.EndTime.Sub(*options.StartTime) < 24*time.Hour {
+				req.StartTime(options.StartTime.UnixMilli())
+				req.EndTime(options.EndTime.UnixMilli())
+			} else {
+				req.StartTime(options.StartTime.UnixMilli())
+			}
+		} else if options.StartTime != nil {
 			req.StartTime(options.StartTime.UnixMilli())
+		} else if options.EndTime != nil {
 			req.EndTime(options.EndTime.UnixMilli())
-		} else {
-			req.StartTime(options.StartTime.UnixMilli())
 		}
-	} else if options.StartTime != nil {
-		req.StartTime(options.StartTime.UnixMilli())
-	} else if options.EndTime != nil {
-		req.EndTime(options.EndTime.UnixMilli())
 	}
 
 	remoteTrades, err = req.Do(ctx)
@@ -1449,90 +1253,41 @@ func (e *Exchange) queryMarginTrades(ctx context.Context, symbol string, options
 	return trades, nil
 }
 
-func (e *Exchange) queryFuturesTrades(ctx context.Context, symbol string, options *types.TradeQueryOptions) (trades []types.Trade, err error) {
-
-	var remoteTrades []*futures.AccountTrade
-	req := e.futuresClient.NewListAccountTradeService().
-		Symbol(symbol)
-	if options.Limit > 0 {
-		req.Limit(int(options.Limit))
-	} else {
-		req.Limit(1000)
-	}
+func (e *Exchange) querySpotTrades(ctx context.Context, symbol string, options *types.TradeQueryOptions) (trades []types.Trade, err error) {
+	req := e.client2.NewGetMyTradesRequest()
+	req.Symbol(symbol)
 
 	// BINANCE uses inclusive last trade ID
 	if options.LastTradeID > 0 {
-		req.FromID(int64(options.LastTradeID))
-	}
-
-	// The parameter fromId cannot be sent with startTime or endTime.
-	// Mentioned in binance futures docs
-	if options.LastTradeID <= 0 {
+		req.FromID(options.LastTradeID)
+	} else {
 		if options.StartTime != nil && options.EndTime != nil {
 			if options.EndTime.Sub(*options.StartTime) < 24*time.Hour {
-				req.StartTime(options.StartTime.UnixMilli())
-				req.EndTime(options.EndTime.UnixMilli())
+				req.StartTime(*options.StartTime)
+				req.EndTime(*options.EndTime)
 			} else {
-				req.StartTime(options.StartTime.UnixMilli())
+				req.StartTime(*options.StartTime)
 			}
+		} else if options.StartTime != nil {
+			req.StartTime(*options.StartTime)
 		} else if options.EndTime != nil {
-			req.EndTime(options.EndTime.UnixMilli())
+			req.EndTime(*options.EndTime)
 		}
 	}
-
-	remoteTrades, err = req.Do(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for _, t := range remoteTrades {
-		localTrade, err := toGlobalFuturesTrade(*t)
-		if err != nil {
-			log.WithError(err).Errorf("can not convert binance futures trade: %+v", t)
-			continue
-		}
-
-		trades = append(trades, *localTrade)
-	}
-
-	trades = types.SortTradesAscending(trades)
-	return trades, nil
-}
-
-func (e *Exchange) querySpotTrades(ctx context.Context, symbol string, options *types.TradeQueryOptions) (trades []types.Trade, err error) {
-	var remoteTrades []*binance.TradeV3
-	req := e.client.NewListTradesService().
-		Symbol(symbol)
 
 	if options.Limit > 0 {
-		req.Limit(int(options.Limit))
+		req.Limit(uint64(options.Limit))
 	} else {
 		req.Limit(1000)
 	}
 
-	// BINANCE uses inclusive last trade ID
-	if options.LastTradeID > 0 {
-		req.FromID(int64(options.LastTradeID))
-	}
-
-	if options.StartTime != nil && options.EndTime != nil {
-		if options.EndTime.Sub(*options.StartTime) < 24*time.Hour {
-			req.StartTime(options.StartTime.UnixMilli())
-			req.EndTime(options.EndTime.UnixMilli())
-		} else {
-			req.StartTime(options.StartTime.UnixMilli())
-		}
-	} else if options.StartTime != nil {
-		req.StartTime(options.StartTime.UnixMilli())
-	} else if options.EndTime != nil {
-		req.EndTime(options.EndTime.UnixMilli())
-	}
-
-	remoteTrades, err = req.Do(ctx)
+	remoteTrades, err := req.Do(ctx)
 	if err != nil {
 		return nil, err
 	}
+
 	for _, t := range remoteTrades {
-		localTrade, err := toGlobalTrade(*t, e.IsMargin)
+		localTrade, err := toGlobalTrade(t, e.IsMargin)
 		if err != nil {
 			log.WithError(err).Errorf("can not convert binance trade: %+v", t)
 			continue
@@ -1560,34 +1315,39 @@ func (e *Exchange) QueryTrades(ctx context.Context, symbol string, options *type
 
 // DefaultFeeRates returns the Binance VIP 0 fee schedule
 // See also https://www.binance.com/en/fee/schedule
+// See futures fee at: https://www.binance.com/en/fee/futureFee
 func (e *Exchange) DefaultFeeRates() types.ExchangeFee {
+	if e.IsFutures {
+		return types.ExchangeFee{
+			MakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.0180), // 0.0180% -USDT with BNB
+			TakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.0360), // 0.0360% -USDT with BNB
+		}
+	}
+
 	return types.ExchangeFee{
-		MakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.075), // 0.075%
-		TakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.075), // 0.075%
+		MakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.075), // 0.075% with BNB
+		TakerFeeRate: fixedpoint.NewFromFloat(0.01 * 0.075), // 0.075% with BNB
 	}
 }
 
 // QueryDepth query the order book depth of a symbol
 func (e *Exchange) QueryDepth(ctx context.Context, symbol string) (snapshot types.SliceOrderBook, finalUpdateID int64, err error) {
-	var response *binance.DepthResponse
 	if e.IsFutures {
-		res, err := e.futuresClient.NewDepthService().Symbol(symbol).Do(ctx)
-		if err != nil {
-			return snapshot, finalUpdateID, err
-		}
-		response = &binance.DepthResponse{
-			LastUpdateID: res.LastUpdateID,
-			Bids:         res.Bids,
-			Asks:         res.Asks,
-		}
-	} else {
-		response, err = e.client.NewDepthService().Symbol(symbol).Do(ctx)
-		if err != nil {
-			return snapshot, finalUpdateID, err
-		}
+		return e.queryFuturesDepth(ctx, symbol)
 	}
 
+	response, err := e.client.NewDepthService().Symbol(symbol).Do(ctx)
+	if err != nil {
+		return snapshot, finalUpdateID, err
+	}
+
+	return convertDepth(snapshot, symbol, finalUpdateID, response)
+}
+
+func convertDepth(snapshot types.SliceOrderBook, symbol string, finalUpdateID int64, response *binance.DepthResponse) (types.SliceOrderBook, int64, error) {
 	snapshot.Symbol = symbol
+	// empty time since the API does not provide time information.
+	snapshot.Time = time.Time{}
 	finalUpdateID = response.LastUpdateID
 	for _, entry := range response.Bids {
 		// entry.Price, Quantity: entry.Quantity
@@ -1716,4 +1476,14 @@ func calculateMarginTolerance(marginLevel fixedpoint.Value) fixedpoint.Value {
 	// so when marginLevel equals 1.1, the formula becomes 1.0 - 1.0, or zero.
 	// = 1.0 - (1.1 / marginLevel)
 	return fixedpoint.One.Sub(fixedpoint.NewFromFloat(1.1).Div(marginLevel))
+}
+
+func logResponse(resp interface{}, err error, req interface{}) error {
+	if err != nil {
+		log.WithError(err).Errorf("%T: error %+v", req, resp)
+		return err
+	}
+
+	log.Infof("%T: response: %+v", req, resp)
+	return nil
 }
