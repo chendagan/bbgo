@@ -9,11 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/c9s/bbgo/pkg/exchange/bybit/bybitapi"
-	"github.com/c9s/bbgo/pkg/exchange/bybit/mocks"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/testutil"
 	"github.com/c9s/bbgo/pkg/types"
@@ -36,7 +34,7 @@ func getTestClientOrSkip(t *testing.T) *Stream {
 }
 
 func TestStream(t *testing.T) {
-	t.Skip()
+	//t.Skip()
 	s := getTestClientOrSkip(t)
 
 	symbols := []string{
@@ -54,6 +52,9 @@ func TestStream(t *testing.T) {
 	}
 
 	t.Run("Auth test", func(t *testing.T) {
+		s.OnBalanceSnapshot(func(balances types.BalanceMap) {
+			t.Log("got balance snapshot", balances)
+		})
 		s.Connect(context.Background())
 		c := make(chan struct{})
 		<-c
@@ -67,12 +68,12 @@ func TestStream(t *testing.T) {
 		err := s.Connect(context.Background())
 		assert.NoError(t, err)
 
-		s.OnBookSnapshot(func(book types.SliceOrderBook) {
-			t.Log("got snapshot", book)
-		})
-		s.OnBookUpdate(func(book types.SliceOrderBook) {
-			t.Log("got update", book)
-		})
+		//s.OnBookSnapshot(func(book types.SliceOrderBook) {
+		//	t.Log("got snapshot", book)
+		//})
+		//s.OnBookUpdate(func(book types.SliceOrderBook) {
+		//	t.Log("got update", book)
+		//})
 		c := make(chan struct{})
 		<-c
 	})
@@ -126,11 +127,14 @@ func TestStream(t *testing.T) {
 	})
 
 	t.Run("wallet test", func(t *testing.T) {
+		s.OnAuth(func() {
+			t.Log("authenticated")
+		})
 		err := s.Connect(context.Background())
 		assert.NoError(t, err)
 
-		s.OnBalanceSnapshot(func(balances types.BalanceMap) {
-			t.Log("got snapshot", balances)
+		s.OnBalanceUpdate(func(balances types.BalanceMap) {
+			t.Log("got update", balances)
 		})
 		c := make(chan struct{})
 		<-c
@@ -169,7 +173,7 @@ func TestStream(t *testing.T) {
 		assert.NoError(t, err)
 
 		s.OnTradeUpdate(func(trade types.Trade) {
-			t.Log("got update", trade)
+			t.Log("got update", trade.Fee, trade.FeeCurrency, trade)
 		})
 		c := make(chan struct{})
 		<-c
@@ -389,6 +393,28 @@ func Test_convertSubscription(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, genTopic(TopicTypeOrderBook, types.DepthLevel1, "BTCUSDT"), res)
 	})
+	t.Run("BookChannel.DepthLevel50", func(t *testing.T) {
+		res, err := s.convertSubscription(types.Subscription{
+			Symbol:  "BTCUSDT",
+			Channel: types.BookChannel,
+			Options: types.SubscribeOptions{
+				Depth: types.DepthLevel50,
+			},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, genTopic(TopicTypeOrderBook, types.DepthLevel50, "BTCUSDT"), res)
+	})
+	t.Run("BookChannel.DepthLevel200", func(t *testing.T) {
+		res, err := s.convertSubscription(types.Subscription{
+			Symbol:  "BTCUSDT",
+			Channel: types.BookChannel,
+			Options: types.SubscribeOptions{
+				Depth: types.DepthLevel200,
+			},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, genTopic(TopicTypeOrderBook, types.DepthLevel200, "BTCUSDT"), res)
+	})
 	t.Run("BookChannel. with default depth", func(t *testing.T) {
 		res, err := s.convertSubscription(types.Subscription{
 			Symbol:  "BTCUSDT",
@@ -437,122 +463,5 @@ func Test_convertSubscription(t *testing.T) {
 		})
 		assert.NoError(t, err)
 		assert.Equal(t, genTopic(TopicTypeMarketTrade, "BTCUSDT"), res)
-	})
-}
-
-func TestStream_getFeeRate(t *testing.T) {
-	mockCtrl := gomock.NewController(t)
-	defer mockCtrl.Finish()
-
-	unknownErr := errors.New("unknown err")
-
-	t.Run("succeeds", func(t *testing.T) {
-		mockMarketProvider := mocks.NewMockMarketInfoProvider(mockCtrl)
-		s := &Stream{
-			marketProvider: mockMarketProvider,
-		}
-
-		ctx := context.Background()
-		feeRates := bybitapi.FeeRates{
-			List: []bybitapi.FeeRate{
-				{
-					Symbol:       "BTCUSDT",
-					TakerFeeRate: fixedpoint.NewFromFloat(0.001),
-					MakerFeeRate: fixedpoint.NewFromFloat(0.001),
-				},
-				{
-					Symbol:       "ETHUSDT",
-					TakerFeeRate: fixedpoint.NewFromFloat(0.001),
-					MakerFeeRate: fixedpoint.NewFromFloat(0.001),
-				},
-				{
-					Symbol:       "OPTIONCOIN",
-					TakerFeeRate: fixedpoint.NewFromFloat(0.001),
-					MakerFeeRate: fixedpoint.NewFromFloat(0.001),
-				},
-			},
-		}
-
-		mkts := types.MarketMap{
-			"BTCUSDT": types.Market{
-				Symbol:        "BTCUSDT",
-				QuoteCurrency: "USDT",
-				BaseCurrency:  "BTC",
-			},
-			"ETHUSDT": types.Market{
-				Symbol:        "ETHUSDT",
-				QuoteCurrency: "USDT",
-				BaseCurrency:  "ETH",
-			},
-		}
-
-		mockMarketProvider.EXPECT().GetAllFeeRates(ctx).Return(feeRates, nil).Times(1)
-		mockMarketProvider.EXPECT().QueryMarkets(ctx).Return(mkts, nil).Times(1)
-
-		expFeeRates := map[string]*symbolFeeDetail{
-			"BTCUSDT": {
-				FeeRate:   feeRates.List[0],
-				BaseCoin:  "BTC",
-				QuoteCoin: "USDT",
-			},
-			"ETHUSDT": {
-				FeeRate:   feeRates.List[1],
-				BaseCoin:  "ETH",
-				QuoteCoin: "USDT",
-			},
-		}
-		err := s.getAllFeeRates(ctx)
-		assert.NoError(t, err)
-		assert.Equal(t, expFeeRates, s.symbolFeeDetails)
-	})
-
-	t.Run("failed to query markets", func(t *testing.T) {
-		mockMarketProvider := mocks.NewMockMarketInfoProvider(mockCtrl)
-		s := &Stream{
-			marketProvider: mockMarketProvider,
-		}
-
-		ctx := context.Background()
-		feeRates := bybitapi.FeeRates{
-			List: []bybitapi.FeeRate{
-				{
-					Symbol:       "BTCUSDT",
-					TakerFeeRate: fixedpoint.NewFromFloat(0.001),
-					MakerFeeRate: fixedpoint.NewFromFloat(0.001),
-				},
-				{
-					Symbol:       "ETHUSDT",
-					TakerFeeRate: fixedpoint.NewFromFloat(0.001),
-					MakerFeeRate: fixedpoint.NewFromFloat(0.001),
-				},
-				{
-					Symbol:       "OPTIONCOIN",
-					TakerFeeRate: fixedpoint.NewFromFloat(0.001),
-					MakerFeeRate: fixedpoint.NewFromFloat(0.001),
-				},
-			},
-		}
-
-		mockMarketProvider.EXPECT().GetAllFeeRates(ctx).Return(feeRates, nil).Times(1)
-		mockMarketProvider.EXPECT().QueryMarkets(ctx).Return(nil, unknownErr).Times(1)
-
-		err := s.getAllFeeRates(ctx)
-		assert.Equal(t, fmt.Errorf("failed to get markets: %w", unknownErr), err)
-		assert.Equal(t, map[string]*symbolFeeDetail(nil), s.symbolFeeDetails)
-	})
-
-	t.Run("failed to get fee rates", func(t *testing.T) {
-		mockMarketProvider := mocks.NewMockMarketInfoProvider(mockCtrl)
-		s := &Stream{
-			marketProvider: mockMarketProvider,
-		}
-
-		ctx := context.Background()
-
-		mockMarketProvider.EXPECT().GetAllFeeRates(ctx).Return(bybitapi.FeeRates{}, unknownErr).Times(1)
-
-		err := s.getAllFeeRates(ctx)
-		assert.Equal(t, fmt.Errorf("failed to call get fee rates: %w", unknownErr), err)
-		assert.Equal(t, map[string]*symbolFeeDetail(nil), s.symbolFeeDetails)
 	})
 }

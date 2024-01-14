@@ -2,8 +2,10 @@ package strategy
 
 // import built-in strategies
 import (
+	_ "github.com/c9s/bbgo/pkg/strategy/atrpin"
 	_ "github.com/c9s/bbgo/pkg/strategy/audacitymaker"
 	_ "github.com/c9s/bbgo/pkg/strategy/autoborrow"
+	_ "github.com/c9s/bbgo/pkg/strategy/autobuy"
 	_ "github.com/c9s/bbgo/pkg/strategy/bollgrid"
 	_ "github.com/c9s/bbgo/pkg/strategy/bollmaker"
 	_ "github.com/c9s/bbgo/pkg/strategy/convert"
@@ -11,6 +13,7 @@ import (
 	_ "github.com/c9s/bbgo/pkg/strategy/deposit2transfer"
 	_ "github.com/c9s/bbgo/pkg/strategy/drift"
 	_ "github.com/c9s/bbgo/pkg/strategy/elliottwave"
+	_ "github.com/c9s/bbgo/pkg/strategy/emacross"
 	_ "github.com/c9s/bbgo/pkg/strategy/emastop"
 	_ "github.com/c9s/bbgo/pkg/strategy/etf"
 	_ "github.com/c9s/bbgo/pkg/strategy/ewoDgtrd"
@@ -24,10 +27,12 @@ import (
 	_ "github.com/c9s/bbgo/pkg/strategy/irr"
 	_ "github.com/c9s/bbgo/pkg/strategy/kline"
 	_ "github.com/c9s/bbgo/pkg/strategy/linregmaker"
+	_ "github.com/c9s/bbgo/pkg/strategy/liquiditymaker"
 	_ "github.com/c9s/bbgo/pkg/strategy/marketcap"
 	_ "github.com/c9s/bbgo/pkg/strategy/pivotshort"
 	_ "github.com/c9s/bbgo/pkg/strategy/pricealert"
 	_ "github.com/c9s/bbgo/pkg/strategy/pricedrop"
+	_ "github.com/c9s/bbgo/pkg/strategy/random"
 	_ "github.com/c9s/bbgo/pkg/strategy/rebalance"
 	_ "github.com/c9s/bbgo/pkg/strategy/rsicross"
 	_ "github.com/c9s/bbgo/pkg/strategy/rsmaker"
@@ -42,9 +47,10 @@ import (
 	_ "github.com/c9s/bbgo/pkg/strategy/wall"
 	_ "github.com/c9s/bbgo/pkg/strategy/xalign"
 	_ "github.com/c9s/bbgo/pkg/strategy/xbalance"
+	_ "github.com/c9s/bbgo/pkg/strategy/xdepthmaker"
+	_ "github.com/c9s/bbgo/pkg/strategy/xfixedmaker"
 	_ "github.com/c9s/bbgo/pkg/strategy/xfunding"
 	_ "github.com/c9s/bbgo/pkg/strategy/xgap"
 	_ "github.com/c9s/bbgo/pkg/strategy/xmaker"
 	_ "github.com/c9s/bbgo/pkg/strategy/xnav"
-	_ "github.com/c9s/bbgo/pkg/strategy/xpuremaker"
 )

@@ -108,13 +108,13 @@ type Environment struct {
 	syncStatus      SyncStatus
 	syncConfig      *SyncConfig
 
-	loggingConfig *LoggingConfig
+	loggingConfig     *LoggingConfig
+	environmentConfig *EnvironmentConfig
 
 	sessions map[string]*ExchangeSession
 }
 
 func NewEnvironment() *Environment {
-
 	now := time.Now()
 	return &Environment{
 		// default trade scan time
@@ -124,6 +124,14 @@ func NewEnvironment() *Environment {
 
 		syncStatus: SyncNotStarted,
 	}
+}
+
+func (environ *Environment) Logger() log.FieldLogger {
+	if environ.loggingConfig != nil && len(environ.loggingConfig.Fields) > 0 {
+		return log.WithFields(environ.loggingConfig.Fields)
+	}
+
+	return log.StandardLogger()
 }
 
 func (environ *Environment) Session(name string) (*ExchangeSession, bool) {
@@ -443,10 +451,12 @@ func (environ *Environment) syncWithUserConfig(ctx context.Context, userConfig *
 		sessions = environ.SelectSessions(selectedSessions...)
 	}
 
-	since := time.Now().AddDate(0, -6, 0)
+	since := defaultSyncSinceTime()
 	if userConfig.Sync.Since != nil {
 		since = userConfig.Sync.Since.Time()
 	}
+
+	environ.SetSyncStartTime(since)
 
 	syncSymbolMap, restSymbols := categorizeSyncSymbol(userConfig.Sync.Symbols)
 	for _, session := range sessions {
@@ -455,7 +465,7 @@ func (environ *Environment) syncWithUserConfig(ctx context.Context, userConfig *
 			syncSymbols = append(syncSymbols, ss...)
 		}
 
-		if err := environ.syncSession(ctx, session, syncSymbols...); err != nil {
+		if err := environ.syncSession(ctx, session, since, syncSymbols...); err != nil {
 			return err
 		}
 
@@ -512,8 +522,9 @@ func (environ *Environment) Sync(ctx context.Context, userConfig ...*Config) err
 	}
 
 	// the default sync logics
+	since := defaultSyncSinceTime()
 	for _, session := range environ.sessions {
-		if err := environ.syncSession(ctx, session); err != nil {
+		if err := environ.syncSession(ctx, session, since); err != nil {
 			return err
 		}
 	}
@@ -554,7 +565,7 @@ func (environ *Environment) RecordPosition(position *types.Position, trade types
 		return
 	}
 
-	// set profit info to position
+	// guard: set profit info to position if the strategy info is empty
 	if profit != nil {
 		if position.Strategy == "" && profit.Strategy != "" {
 			position.Strategy = profit.Strategy
@@ -565,10 +576,12 @@ func (environ *Environment) RecordPosition(position *types.Position, trade types
 		}
 	}
 
+	log.Infof("recordPosition: position = %s, trade = %+v, profit = %+v", position.Base.String(), trade, profit)
 	if profit != nil {
 		if err := environ.PositionService.Insert(position, trade, profit.Profit); err != nil {
 			log.WithError(err).Errorf("can not insert position record")
 		}
+
 		if err := environ.ProfitService.Insert(*profit); err != nil {
 			log.WithError(err).Errorf("can not insert profit record: %+v", profit)
 		}
@@ -608,10 +621,13 @@ func (environ *Environment) SyncSession(ctx context.Context, session *ExchangeSe
 	environ.setSyncing(Syncing)
 	defer environ.setSyncing(SyncDone)
 
-	return environ.syncSession(ctx, session, defaultSymbols...)
+	since := defaultSyncSinceTime()
+	return environ.syncSession(ctx, session, since, defaultSymbols...)
 }
 
-func (environ *Environment) syncSession(ctx context.Context, session *ExchangeSession, defaultSymbols ...string) error {
+func (environ *Environment) syncSession(
+	ctx context.Context, session *ExchangeSession, syncStartTime time.Time, defaultSymbols ...string,
+) error {
 	symbols, err := session.getSessionSymbols(defaultSymbols...)
 	if err != nil {
 		return err
@@ -619,7 +635,7 @@ func (environ *Environment) syncSession(ctx context.Context, session *ExchangeSe
 
 	log.Infof("syncing symbols %v from session %s", symbols, session.Name)
 
-	return environ.SyncService.SyncSessionSymbols(ctx, session.Exchange, environ.syncStartTime, symbols...)
+	return environ.SyncService.SyncSessionSymbols(ctx, session.Exchange, syncStartTime, symbols...)
 }
 
 func (environ *Environment) ConfigureNotificationSystem(ctx context.Context, userConfig *Config) error {
@@ -857,7 +873,9 @@ func (environ *Environment) setupSlack(userConfig *Config, slackToken string, pe
 	interact.AddMessenger(messenger)
 }
 
-func (environ *Environment) setupTelegram(userConfig *Config, telegramBotToken string, persistence service.PersistenceService) error {
+func (environ *Environment) setupTelegram(
+	userConfig *Config, telegramBotToken string, persistence service.PersistenceService,
+) error {
 	tt := strings.Split(telegramBotToken, ":")
 	telegramID := tt[0]
 
@@ -1002,5 +1020,9 @@ func (session *ExchangeSession) getSessionSymbols(defaultSymbols ...string) ([]s
 		return defaultSymbols, nil
 	}
 
-	return session.FindPossibleSymbols()
+	return session.FindPossibleAssetSymbols()
+}
+
+func defaultSyncSinceTime() time.Time {
+	return time.Now().AddDate(0, -6, 0)
 }

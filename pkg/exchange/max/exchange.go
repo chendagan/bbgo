@@ -22,6 +22,11 @@ import (
 
 var log = logrus.WithField("exchange", "max")
 
+func init() {
+	_ = types.ExchangeTradeHistoryService(&Exchange{})
+
+}
+
 type Exchange struct {
 	types.MarginSettings
 
@@ -241,37 +246,92 @@ func (e *Exchange) QueryOrder(ctx context.Context, q types.OrderQuery) (*types.O
 	return toGlobalOrder(*maxOrder)
 }
 
-func (e *Exchange) QueryOpenOrders(ctx context.Context, symbol string) (orders []types.Order, err error) {
+func (e *Exchange) QueryOpenOrders(ctx context.Context, symbol string) ([]types.Order, error) {
 	market := toLocalSymbol(symbol)
 	walletType := maxapi.WalletTypeSpot
 	if e.MarginSettings.IsMargin {
 		walletType = maxapi.WalletTypeMargin
 	}
 
-	maxOrders, err := e.v3client.NewGetWalletOpenOrdersRequest(walletType).Market(market).Do(ctx)
+	// timestamp can't be negative, so we need to use time which epochtime is > 0
+	since, err := e.getLaunchDate()
 	if err != nil {
-		return orders, err
+		return nil, err
 	}
 
-	for _, maxOrder := range maxOrders {
-		order, err := toGlobalOrder(maxOrder)
+	// use types.OrderMap because the timestamp params is inclusive. We will get the duplicated order if we use the last order as new since.
+	// If we use since = since + 1ms, we may miss some orders with the same created_at.
+	// As a result, we use OrderMap to avoid duplicated or missing order.
+	var orderMap types.OrderMap = make(types.OrderMap)
+	var limit uint = 1000
+	for {
+		req := e.v3client.NewGetWalletOpenOrdersRequest(walletType).Market(market).Timestamp(since).OrderBy(maxapi.OrderByAsc).Limit(limit)
+		maxOrders, err := req.Do(ctx)
 		if err != nil {
-			return orders, err
+			return nil, err
 		}
 
-		orders = append(orders, *order)
+		numUniqueOrders := 0
+		for _, maxOrder := range maxOrders {
+			createdAt := maxOrder.CreatedAt.Time()
+			if createdAt.After(since) {
+				since = createdAt
+			}
+
+			order, err := toGlobalOrder(maxOrder)
+			if err != nil {
+				return nil, err
+			}
+
+			if _, exist := orderMap[order.OrderID]; !exist {
+				orderMap[order.OrderID] = *order
+				numUniqueOrders++
+			}
+		}
+
+		if len(maxOrders) < int(limit) {
+			break
+		}
+
+		if numUniqueOrders == 0 {
+			break
+		}
 	}
 
-	return orders, err
+	return orderMap.Orders(), err
 }
 
-// lastOrderID is not supported on MAX
-func (e *Exchange) QueryClosedOrders(ctx context.Context, symbol string, since, until time.Time, lastOrderID uint64) ([]types.Order, error) {
-	log.Warn("!!!MAX EXCHANGE API NOTICE!!! the since/until conditions will not be effected on closed orders query, max exchange does not support time-range-based query")
+func (e *Exchange) QueryClosedOrders(
+	ctx context.Context, symbol string, since, until time.Time, lastOrderID uint64,
+) ([]types.Order, error) {
+	if !since.IsZero() || !until.IsZero() {
+		return e.queryClosedOrdersByTime(ctx, symbol, since, until, maxapi.OrderByAsc)
+	}
+
 	return e.queryClosedOrdersByLastOrderID(ctx, symbol, lastOrderID)
 }
 
-func (e *Exchange) queryClosedOrdersByLastOrderID(ctx context.Context, symbol string, lastOrderID uint64) (orders []types.Order, err error) {
+func (e *Exchange) QueryClosedOrdersDesc(
+	ctx context.Context, symbol string, since, until time.Time, lastOrderID uint64,
+) ([]types.Order, error) {
+	closedOrders, err := e.queryClosedOrdersByTime(ctx, symbol, since, until, maxapi.OrderByDesc)
+	if lastOrderID == 0 {
+		return closedOrders, err
+	}
+
+	var filterClosedOrders []types.Order
+	for _, closedOrder := range closedOrders {
+		if closedOrder.OrderID > lastOrderID {
+			filterClosedOrders = append(filterClosedOrders, closedOrder)
+		}
+	}
+
+	return filterClosedOrders, err
+}
+
+func (e *Exchange) queryClosedOrdersByLastOrderID(
+	ctx context.Context, symbol string, lastOrderID uint64,
+) (orders []types.Order, err error) {
 	if err := e.closedOrderQueryLimiter.Wait(ctx); err != nil {
 		return orders, err
 	}
@@ -282,13 +342,14 @@ func (e *Exchange) queryClosedOrdersByLastOrderID(ctx context.Context, symbol st
 		walletType = maxapi.WalletTypeMargin
 	}
 
-	req := e.v3client.NewGetWalletOrderHistoryRequest(walletType).Market(market)
 	if lastOrderID == 0 {
 		lastOrderID = 1
 	}
 
-	req.FromID(lastOrderID)
-	req.Limit(1000)
+	req := e.v3client.NewGetWalletOrderHistoryRequest(walletType).
+		Market(market).
+		FromID(lastOrderID).
+		Limit(1000)
 
 	maxOrders, err := req.Do(ctx)
 	if err != nil {
@@ -309,6 +370,76 @@ func (e *Exchange) queryClosedOrdersByLastOrderID(ctx context.Context, symbol st
 		return nil, err
 	}
 	return types.SortOrdersAscending(orders), nil
+}
+
+func (e *Exchange) queryClosedOrdersByTime(ctx context.Context, symbol string, since, until time.Time, orderByType maxapi.OrderByType) (orders []types.Order, err error) {
+	if err := e.closedOrderQueryLimiter.Wait(ctx); err != nil {
+		return orders, err
+	}
+
+	// there is since limit for closed orders API. If the since is before launch date, it will respond error
+	sinceLimit, err := e.getLaunchDate()
+	if err != nil {
+		return orders, err
+	}
+	if since.Before(sinceLimit) {
+		since = sinceLimit
+	}
+
+	if until.IsZero() {
+		until = time.Now()
+	}
+
+	market := toLocalSymbol(symbol)
+	walletType := maxapi.WalletTypeSpot
+	if e.MarginSettings.IsMargin {
+		walletType = maxapi.WalletTypeMargin
+	}
+
+	req := e.v3client.NewGetWalletClosedOrdersRequest(walletType).
+		Market(market).
+		Limit(1000).
+		OrderBy(orderByType)
+
+	switch orderByType {
+	case maxapi.OrderByAsc:
+		req.Timestamp(since)
+	case maxapi.OrderByDesc:
+		req.Timestamp(until)
+	case maxapi.OrderByAscUpdatedAt:
+		// not implement yet
+		return nil, fmt.Errorf("unsupported order by type: %s", orderByType)
+	case maxapi.OrderByDescUpdatedAt:
+		// not implement yet
+		return nil, fmt.Errorf("unsupported order by type: %s", orderByType)
+	default:
+		return nil, fmt.Errorf("unsupported order by type: %s", orderByType)
+	}
+
+	maxOrders, err := req.Do(ctx)
+	if err != nil {
+		return orders, err
+	}
+
+	for _, maxOrder := range maxOrders {
+		createdAt := maxOrder.CreatedAt.Time()
+		if createdAt.Before(since) || createdAt.After(until) {
+			continue
+		}
+
+		order, err2 := toGlobalOrder(maxOrder)
+		if err2 != nil {
+			err = multierr.Append(err, err2)
+			continue
+		}
+
+		orders = append(orders, *order)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return orders, nil
 }
 
 func (e *Exchange) CancelAllOrders(ctx context.Context) ([]types.Order, error) {
@@ -429,7 +560,9 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) (err
 	return err2
 }
 
-func (e *Exchange) Withdraw(ctx context.Context, asset string, amount fixedpoint.Value, address string, options *types.WithdrawalOptions) error {
+func (e *Exchange) Withdraw(
+	ctx context.Context, asset string, amount fixedpoint.Value, address string, options *types.WithdrawalOptions,
+) error {
 	asset = toLocalCurrency(asset)
 
 	addresses, err := e.client.WithdrawalService.NewGetWithdrawalAddressesRequest().
@@ -664,8 +797,8 @@ func (e *Exchange) queryBalances(ctx context.Context, walletType maxapi.WalletTy
 			Currency:  cur,
 			Available: b.Balance,
 			Locked:    b.Locked,
-			NetAsset:  b.Balance.Add(b.Locked).Sub(b.Debt),
-			Borrowed:  b.Borrowed,
+			NetAsset:  b.Balance.Add(b.Locked).Sub(b.Principal).Sub(b.Interest),
+			Borrowed:  b.Principal,
 			Interest:  b.Interest,
 		}
 	}
@@ -673,7 +806,9 @@ func (e *Exchange) queryBalances(ctx context.Context, walletType maxapi.WalletTy
 	return balances, nil
 }
 
-func (e *Exchange) QueryWithdrawHistory(ctx context.Context, asset string, since, until time.Time) (allWithdraws []types.Withdraw, err error) {
+func (e *Exchange) QueryWithdrawHistory(
+	ctx context.Context, asset string, since, until time.Time,
+) (allWithdraws []types.Withdraw, err error) {
 	startTime := since
 	limit := 1000
 	txIDs := map[string]struct{}{}
@@ -769,7 +904,9 @@ func (e *Exchange) QueryWithdrawHistory(ctx context.Context, asset string, since
 	return allWithdraws, nil
 }
 
-func (e *Exchange) QueryDepositHistory(ctx context.Context, asset string, since, until time.Time) (allDeposits []types.Deposit, err error) {
+func (e *Exchange) QueryDepositHistory(
+	ctx context.Context, asset string, since, until time.Time,
+) (allDeposits []types.Deposit, err error) {
 	startTime := since
 	limit := 1000
 	txIDs := map[string]struct{}{}
@@ -846,7 +983,9 @@ func (e *Exchange) QueryDepositHistory(ctx context.Context, asset string, since,
 // For this QueryTrades spec (to be compatible with batch.TradeBatchQuery)
 // give LastTradeID       -> ignore start_time (but still can filter the end_time)
 // without any parameters -> return trades within 24 hours
-func (e *Exchange) QueryTrades(ctx context.Context, symbol string, options *types.TradeQueryOptions) (trades []types.Trade, err error) {
+func (e *Exchange) QueryTrades(
+	ctx context.Context, symbol string, options *types.TradeQueryOptions,
+) (trades []types.Trade, err error) {
 	if err := e.queryTradeLimiter.Wait(ctx); err != nil {
 		return nil, err
 	}
@@ -964,7 +1103,9 @@ func (e *Exchange) QueryRewards(ctx context.Context, startTime time.Time) ([]typ
 // https://max-api.maicoin.com/api/v2/k?market=btctwd&limit=10&period=1&timestamp=1620202440
 // The above query will return a kline that starts with 1620202440 (unix timestamp) without endTime.
 // We need to calculate the endTime by ourself.
-func (e *Exchange) QueryKLines(ctx context.Context, symbol string, interval types.Interval, options types.KLineQueryOptions) ([]types.KLine, error) {
+func (e *Exchange) QueryKLines(
+	ctx context.Context, symbol string, interval types.Interval, options types.KLineQueryOptions,
+) ([]types.KLine, error) {
 	if err := e.marketDataLimiter.Wait(ctx); err != nil {
 		return nil, err
 	}
@@ -1041,7 +1182,9 @@ func (e *Exchange) BorrowMarginAsset(ctx context.Context, asset string, amount f
 	return nil
 }
 
-func (e *Exchange) QueryMarginAssetMaxBorrowable(ctx context.Context, asset string) (amount fixedpoint.Value, err error) {
+func (e *Exchange) QueryMarginAssetMaxBorrowable(
+	ctx context.Context, asset string,
+) (amount fixedpoint.Value, err error) {
 	req := e.v3client.NewGetMarginBorrowingLimitsRequest()
 	resp, err := req.Do(ctx)
 	if err != nil {

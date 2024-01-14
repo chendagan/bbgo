@@ -192,6 +192,16 @@ var BacktestCmd = &cobra.Command{
 				return err
 			}
 			sourceExchanges[exName] = publicExchange
+
+			// Set exchange to use futures
+			if userConfig.Sessions[exName.String()].Futures {
+				futuresExchange, ok := publicExchange.(types.FuturesExchange)
+				if !ok {
+					return fmt.Errorf("exchange %s does not support futures", publicExchange.Name())
+				}
+
+				futuresExchange.UseFutures()
+			}
 		}
 
 		var syncFromTime time.Time
@@ -269,6 +279,7 @@ var BacktestCmd = &cobra.Command{
 			exchangeFromConfig := userConfig.Sessions[name.String()]
 			if exchangeFromConfig != nil {
 				session.UseHeikinAshi = exchangeFromConfig.UseHeikinAshi
+				session.Futures = exchangeFromConfig.Futures
 			}
 		}
 
@@ -308,6 +319,8 @@ var BacktestCmd = &cobra.Command{
 		var reportDir = outputDirectory
 		var sessionTradeStats = make(map[string]map[string]*types.TradeStats)
 
+		// for each exchange session, iterate the positions and
+		// allocate trade collector to calculate the tradeStats
 		var tradeCollectorList []*core.TradeCollector
 		for _, exSource := range exchangeSources {
 			sessionName := exSource.Session.Name
@@ -335,6 +348,7 @@ var BacktestCmd = &cobra.Command{
 			}
 			sessionTradeStats[sessionName] = tradeStatsMap
 		}
+
 		kLineHandlers = append(kLineHandlers, func(k types.KLine, _ *backtest.ExchangeDataSource) {
 			if k.Interval == types.Interval1d && k.Closed {
 				for _, collector := range tradeCollectorList {
@@ -525,6 +539,11 @@ var BacktestCmd = &cobra.Command{
 
 		for _, session := range environ.Sessions() {
 			for symbol, trades := range session.Trades {
+				if len(trades.Trades) == 0 {
+					log.Warnf("session has no %s trades", symbol)
+					continue
+				}
+
 				tradeState := sessionTradeStats[session.Name][symbol]
 				profitFactor := tradeState.ProfitFactor
 				winningRatio := tradeState.WinningRatio
@@ -595,8 +614,11 @@ var BacktestCmd = &cobra.Command{
 	},
 }
 
-func createSymbolReport(userConfig *bbgo.Config, session *bbgo.ExchangeSession, symbol string, trades []types.Trade, intervalProfit *types.IntervalProfitCollector,
-	profitFactor, winningRatio fixedpoint.Value) (
+func createSymbolReport(
+	userConfig *bbgo.Config, session *bbgo.ExchangeSession, symbol string, trades []types.Trade,
+	intervalProfit *types.IntervalProfitCollector,
+	profitFactor, winningRatio fixedpoint.Value,
+) (
 	*backtest.SessionSymbolReport,
 	error,
 ) {
@@ -666,7 +688,10 @@ func createSymbolReport(userConfig *bbgo.Config, session *bbgo.ExchangeSession, 
 	return &symbolReport, nil
 }
 
-func verify(userConfig *bbgo.Config, backtestService *service.BacktestService, sourceExchanges map[types.ExchangeName]types.Exchange, startTime, endTime time.Time) error {
+func verify(
+	userConfig *bbgo.Config, backtestService *service.BacktestService,
+	sourceExchanges map[types.ExchangeName]types.Exchange, startTime, endTime time.Time,
+) error {
 	for _, sourceExchange := range sourceExchanges {
 		err := backtestService.Verify(sourceExchange, userConfig.Backtest.Symbols, startTime, endTime)
 		if err != nil {
@@ -706,7 +731,10 @@ func getExchangeIntervals(ex types.Exchange) types.IntervalMap {
 	return types.SupportedIntervals
 }
 
-func sync(ctx context.Context, userConfig *bbgo.Config, backtestService *service.BacktestService, sourceExchanges map[types.ExchangeName]types.Exchange, syncFrom, syncTo time.Time) error {
+func sync(
+	ctx context.Context, userConfig *bbgo.Config, backtestService *service.BacktestService,
+	sourceExchanges map[types.ExchangeName]types.Exchange, syncFrom, syncTo time.Time,
+) error {
 	for _, symbol := range userConfig.Backtest.Symbols {
 		for _, sourceExchange := range sourceExchanges {
 			var supportIntervals = getExchangeIntervals(sourceExchange)

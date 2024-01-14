@@ -22,9 +22,11 @@ type GridProfitStats struct {
 	TotalFee         map[string]fixedpoint.Value `json:"totalFee,omitempty"`
 	Volume           fixedpoint.Value            `json:"volume,omitempty"`
 	Market           types.Market                `json:"market,omitempty"`
-	ProfitEntries    []*GridProfit               `json:"profitEntries,omitempty"`
 	Since            *time.Time                  `json:"since,omitempty"`
 	InitialOrderID   uint64                      `json:"initialOrderID"`
+
+	// ttl is the ttl to keep in persistence
+	ttl time.Duration
 }
 
 func newGridProfitStats(market types.Market) *GridProfitStats {
@@ -38,8 +40,18 @@ func newGridProfitStats(market types.Market) *GridProfitStats {
 		TotalFee:         make(map[string]fixedpoint.Value),
 		Volume:           fixedpoint.Zero,
 		Market:           market,
-		ProfitEntries:    nil,
 	}
+}
+
+func (s *GridProfitStats) SetTTL(ttl time.Duration) {
+	if ttl.Nanoseconds() <= 0 {
+		return
+	}
+	s.ttl = ttl
+}
+
+func (s *GridProfitStats) Expiration() time.Duration {
+	return s.ttl
 }
 
 func (s *GridProfitStats) AddTrade(trade types.Trade) {
@@ -69,8 +81,6 @@ func (s *GridProfitStats) AddProfit(profit *GridProfit) {
 	case s.Market.BaseCurrency:
 		s.TotalBaseProfit = s.TotalBaseProfit.Add(profit.Profit)
 	}
-
-	s.ProfitEntries = append(s.ProfitEntries, profit)
 }
 
 func (s *GridProfitStats) SlackAttachment() slack.Attachment {

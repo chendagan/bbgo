@@ -2,7 +2,6 @@ package grid2
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -178,6 +177,7 @@ type Strategy struct {
 
 	GridProfitStats *GridProfitStats `persistence:"grid_profit_stats"`
 	Position        *types.Position  `persistence:"position"`
+	PersistenceTTL  types.Duration   `json:"persistenceTTL"`
 
 	// ExchangeSession is an injection field
 	ExchangeSession *bbgo.ExchangeSession
@@ -204,6 +204,8 @@ type Strategy struct {
 
 	tradingCtx, writeCtx context.Context
 	cancelWrite          context.CancelFunc
+
+	recoverC chan struct{}
 
 	// this ensures that bbgo.Sync to lock the object
 	sync.Mutex
@@ -262,7 +264,9 @@ func (s *Strategy) Initialize() error {
 }
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
-	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: types.Interval1m})
+	if !s.TriggerPrice.IsZero() || !s.StopLossPrice.IsZero() || !s.TakeProfitPrice.IsZero() {
+		session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: types.Interval1m})
+	}
 
 	if s.AutoRange != nil {
 		interval := s.AutoRange.Interval()
@@ -378,9 +382,9 @@ func (s *Strategy) verifyOrderTrades(o types.Order, trades []types.Trade) bool {
 	return true
 }
 
-// aggregateOrderFee collects the base fee quantity from the given order
+// aggregateOrderQuoteAmountAndBaseFee collects the base fee quantity from the given order
 // it falls back to query the trades via the RESTful API when the websocket trades are not all received.
-func (s *Strategy) aggregateOrderFee(o types.Order) (fixedpoint.Value, string) {
+func (s *Strategy) aggregateOrderQuoteAmountAndFee(o types.Order) (fixedpoint.Value, fixedpoint.Value, string) {
 	// try to get the received trades (websocket trades)
 	orderTrades := s.historicalTrades.GetOrderTrades(o)
 	if len(orderTrades) > 0 {
@@ -396,16 +400,17 @@ func (s *Strategy) aggregateOrderFee(o types.Order) (fixedpoint.Value, string) {
 		// if one of the trades is missing, we need to query the trades from the RESTful API
 		if s.verifyOrderTrades(o, orderTrades) {
 			// if trades are verified
+			quoteAmount := aggregateTradesQuoteQuantity(orderTrades)
 			fees := collectTradeFee(orderTrades)
 			if fee, ok := fees[feeCurrency]; ok {
-				return fee, feeCurrency
+				return quoteAmount, fee, feeCurrency
 			}
-			return fixedpoint.Zero, feeCurrency
+			return quoteAmount, fixedpoint.Zero, feeCurrency
 		}
 
 		// if we don't support orderQueryService, then we should just skip
 		if s.orderQueryService == nil {
-			return fixedpoint.Zero, feeCurrency
+			return fixedpoint.Zero, fixedpoint.Zero, feeCurrency
 		}
 
 		s.logger.Warnf("GRID: missing #%d order trades or missing trade fee, pulling order trades from API", o.OrderID)
@@ -423,13 +428,14 @@ func (s *Strategy) aggregateOrderFee(o types.Order) (fixedpoint.Value, string) {
 		}
 	}
 
+	quoteAmount := aggregateTradesQuoteQuantity(orderTrades)
 	// still try to aggregate the trades quantity if we can:
 	fees := collectTradeFee(orderTrades)
 	if fee, ok := fees[feeCurrency]; ok {
-		return fee, feeCurrency
+		return quoteAmount, fee, feeCurrency
 	}
 
-	return fixedpoint.Zero, feeCurrency
+	return quoteAmount, fixedpoint.Zero, feeCurrency
 }
 
 func (s *Strategy) processFilledOrder(o types.Order) {
@@ -446,7 +452,6 @@ func (s *Strategy) processFilledOrder(o types.Order) {
 	}
 
 	newQuantity := executedQuantity
-	executedPrice := o.Price
 
 	if o.ExecutedQuantity.Compare(o.Quantity) != 0 {
 		s.logger.Warnf("order #%d is filled, but order executed quantity %s != order quantity %s, something is wrong", o.OrderID, o.ExecutedQuantity, o.Quantity)
@@ -458,16 +463,11 @@ func (s *Strategy) processFilledOrder(o types.Order) {
 		}
 	*/
 
-	// will be used for calculating quantity
-	orderExecutedQuoteAmount := executedQuantity.Mul(executedPrice)
-	// round down order executed quote amount to avoid insufficient balance
-	orderExecutedQuoteAmount = orderExecutedQuoteAmount.Round(s.Market.PricePrecision, fixedpoint.Down)
-
 	// collect trades for fee
 	// fee calculation is used to reduce the order quantity
 	// because when 1.0 BTC buy order is filled without FEE token, then we will actually get 1.0 * (1 - feeRate) BTC
 	// if we don't reduce the sell quantity, than we might fail to place the sell order
-	fee, feeCurrency := s.aggregateOrderFee(o)
+	orderExecutedQuoteAmount, fee, feeCurrency := s.aggregateOrderQuoteAmountAndFee(o)
 	s.logger.Infof("GRID ORDER #%d %s FEE: %s %s",
 		o.OrderID, o.Side,
 		fee.String(), feeCurrency)
@@ -799,6 +799,8 @@ func (s *Strategy) calculateBaseQuoteInvestmentQuantity(
 		if numberOfSellOrders > 0 {
 			numberOfSellOrders--
 		}
+
+		s.logger.Infof("calculated number of sell orders: %d", numberOfSellOrders)
 	}
 
 	// if the maxBaseQuantity is less than minQuantity, then we need to reduce the number of the sell orders
@@ -813,8 +815,12 @@ func (s *Strategy) calculateBaseQuoteInvestmentQuantity(
 		s.Market.MinQuantity)
 
 	if baseQuantity.Compare(minBaseQuantity) <= 0 {
+		s.logger.Infof("base quantity %s is less than min base quantity: %s, adjusting...", baseQuantity.String(), minBaseQuantity.String())
+
 		baseQuantity = s.Market.RoundUpQuantityByPrecision(minBaseQuantity)
 		numberOfSellOrders = int(math.Floor(baseInvestment.Div(baseQuantity).Float64()))
+
+		s.logger.Infof("adjusted base quantity to %s", baseQuantity.String())
 	}
 
 	s.logger.Infof("grid base investment sell orders: %d", numberOfSellOrders)
@@ -827,7 +833,8 @@ func (s *Strategy) calculateBaseQuoteInvestmentQuantity(
 	// quoteInvestment = (p1 + p2 + p3) * q
 	// maxBuyQuantity = quoteInvestment / (p1 + p2 + p3)
 	si := -1
-	for i := len(pins) - 1 - numberOfSellOrders; i >= 0; i-- {
+	end := len(pins) - 1
+	for i := end - numberOfSellOrders - 1; i >= 0; i-- {
 		pin := pins[i]
 		price := fixedpoint.Value(pin)
 
@@ -847,6 +854,7 @@ func (s *Strategy) calculateBaseQuoteInvestmentQuantity(
 				// requiredQuote = requiredQuote.Add(quantity.Mul(nextLowerPrice))
 				totalQuotePrice = totalQuotePrice.Add(nextLowerPrice)
 			}
+
 		} else {
 			// for orders that buy
 			if s.ProfitSpread.IsZero() && i+1 == si {
@@ -854,7 +862,7 @@ func (s *Strategy) calculateBaseQuoteInvestmentQuantity(
 			}
 
 			// should never place a buy order at the upper price
-			if i == len(pins)-1 {
+			if i == end {
 				continue
 			}
 
@@ -862,8 +870,11 @@ func (s *Strategy) calculateBaseQuoteInvestmentQuantity(
 		}
 	}
 
+	s.logger.Infof("total quote price: %f", totalQuotePrice.Float64())
 	if totalQuotePrice.Sign() > 0 && quoteInvestment.Sign() > 0 {
 		quoteSideQuantity := quoteInvestment.Div(totalQuotePrice)
+
+		s.logger.Infof("quote side quantity: %f = %f / %f", quoteSideQuantity.Float64(), quoteInvestment.Float64(), totalQuotePrice.Float64())
 		if numberOfSellOrders > 0 {
 			return fixedpoint.Min(quoteSideQuantity, baseQuantity), nil
 		}
@@ -901,7 +912,6 @@ func (s *Strategy) newOrderUpdateHandler(ctx context.Context, session *bbgo.Exch
 		s.handleOrderFilled(o)
 
 		// sync the profits to redis
-		s.debugGridProfitStats("OrderUpdate")
 		bbgo.Sync(ctx, s)
 
 		s.updateGridNumOfOrdersMetricsWithLock()
@@ -1020,7 +1030,6 @@ func (s *Strategy) CloseGrid(ctx context.Context) error {
 
 	defer s.EmitGridClosed()
 
-	s.debugGridProfitStats("CloseGrid")
 	bbgo.Sync(ctx, s)
 
 	// now we can cancel the open orders
@@ -1061,6 +1070,11 @@ func (s *Strategy) openGrid(ctx context.Context, session *bbgo.ExchangeSession) 
 		err2 := errors.Wrap(err, "unable to get the last trade price")
 		s.EmitGridError(err2)
 		return err2
+	}
+
+	if s.BaseGridNum > 0 {
+		sell1 := fixedpoint.Value(s.grid.Pins[len(s.grid.Pins)-1-s.BaseGridNum])
+		lastPrice = sell1.Sub(s.Market.TickSize)
 	}
 
 	// check if base and quote are enough
@@ -1173,7 +1187,6 @@ func (s *Strategy) openGrid(ctx context.Context, session *bbgo.ExchangeSession) 
 
 	if len(orderIds) > 0 {
 		s.GridProfitStats.InitialOrderID = orderIds[0]
-		s.debugGridProfitStats("openGrid")
 		bbgo.Sync(ctx, s)
 	}
 
@@ -1274,23 +1287,6 @@ func (s *Strategy) debugOrders(desc string, orders []types.Order) {
 	s.logger.Infof(sb.String())
 }
 
-func (s *Strategy) debugGridProfitStats(trigger string) {
-	if !s.Debug {
-		return
-	}
-
-	stats := *s.GridProfitStats
-	// ProfitEntries may have too many profits, make it nil to readable
-	stats.ProfitEntries = nil
-	b, err := json.Marshal(stats)
-	if err != nil {
-		s.logger.WithError(err).Errorf("[%s] failed to debug grid profit stats", trigger)
-		return
-	}
-
-	s.logger.Infof("trigger %s => grid profit stats : %s", trigger, string(b))
-}
-
 func (s *Strategy) debugLog(format string, args ...interface{}) {
 	if !s.Debug {
 		return
@@ -1368,7 +1364,11 @@ func (s *Strategy) generateGridOrders(totalQuote, totalBase, lastPrice fixedpoin
 					ClientOrderID: s.newClientOrderID(),
 				})
 				quoteQuantity := quantity.Mul(nextPrice)
-				usedQuote = usedQuote.Add(quoteQuantity)
+
+				// because the precision issue, we need to round up quote quantity and add it into used quote
+				// e.g. quote we calculate : 8888.85, but it may lock 8888.9 due to their precision.
+				roundUpQuoteQuantity := quoteQuantity.Round(s.Market.PricePrecision, fixedpoint.Up)
+				usedQuote = usedQuote.Add(roundUpQuoteQuantity)
 			}
 		} else {
 			// if price spread is not enabled, and we have already placed a sell order index on the top of this price,
@@ -1384,9 +1384,19 @@ func (s *Strategy) generateGridOrders(totalQuote, totalBase, lastPrice fixedpoin
 
 			quoteQuantity := quantity.Mul(price)
 
-			if usedQuote.Add(quoteQuantity).Compare(totalQuote) > 0 {
-				s.logger.Warnf("used quote %f > total quote %f, this should not happen", usedQuote.Add(quoteQuantity).Float64(), totalQuote.Float64())
-				continue
+			// because the precision issue, we need to round up quote quantity and add it into used quote
+			// e.g. quote we calculate : 8888.85, but it may lock 8888.9 due to their precision.
+			roundUpQuoteQuantity := quoteQuantity.Round(s.Market.PricePrecision, fixedpoint.Up)
+			if usedQuote.Add(roundUpQuoteQuantity).Compare(totalQuote) > 0 {
+				if i > 0 {
+					return nil, fmt.Errorf("used quote %f > total quote %f, this should not happen", usedQuote.Add(quoteQuantity).Float64(), totalQuote.Float64())
+				} else {
+					restQuote := totalQuote.Sub(usedQuote)
+					quantity = restQuote.Div(price).Round(s.Market.VolumePrecision, fixedpoint.Down)
+					if s.Market.MinQuantity.Compare(quantity) > 0 {
+						return nil, fmt.Errorf("the round down quantity (%s) is less than min quantity (%s), we cannot place this order", quantity, s.Market.MinQuantity)
+					}
+				}
 			}
 
 			submitOrders = append(submitOrders, types.SubmitOrder{
@@ -1401,7 +1411,7 @@ func (s *Strategy) generateGridOrders(totalQuote, totalBase, lastPrice fixedpoin
 				GroupID:       s.OrderGroupID,
 				ClientOrderID: s.newClientOrderID(),
 			})
-			usedQuote = usedQuote.Add(quoteQuantity)
+			usedQuote = usedQuote.Add(roundUpQuoteQuantity)
 		}
 	}
 
@@ -1455,6 +1465,8 @@ func calculateMinimalQuoteInvestment(market types.Market, grid *Grid) fixedpoint
 	for i := len(pins) - 2; i >= 0; i-- {
 		pin := pins[i]
 		price := fixedpoint.Value(pin)
+
+		// TODO: should we round the quote here before adding?
 		totalQuote = totalQuote.Add(price.Mul(minQuantity))
 	}
 
@@ -1840,13 +1852,17 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 		s.ProfitSpread = s.Market.TruncatePrice(s.ProfitSpread)
 	}
 
+	s.logger.Infof("persistence ttl: %s", s.PersistenceTTL.Duration())
+
 	if s.GridProfitStats == nil {
 		s.GridProfitStats = newGridProfitStats(s.Market)
 	}
+	s.GridProfitStats.SetTTL(s.PersistenceTTL.Duration())
 
 	if s.Position == nil {
 		s.Position = types.NewPositionFromMarket(s.Market)
 	}
+	s.Position.SetTTL(s.PersistenceTTL.Duration())
 
 	// initialize and register prometheus metrics
 	if s.PrometheusLabels != nil {
@@ -1885,10 +1901,10 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 		s.GridProfitStats.AddTrade(trade)
 	})
 	orderExecutor.TradeCollector().OnPositionUpdate(func(position *types.Position) {
-		s.debugGridProfitStats("OnPositionUpdate")
 		bbgo.Sync(ctx, s)
 	})
 	orderExecutor.ActiveMakerOrders().OnFilled(s.newOrderUpdateHandler(ctx, session))
+	orderExecutor.SetMaxRetries(5)
 
 	if s.logger != nil {
 		orderExecutor.SetLogger(s.logger)
@@ -1968,17 +1984,15 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 
 	// if TriggerPrice is zero, that means we need to open the grid when start up
 	if s.TriggerPrice.IsZero() {
-		// must call the openGrid method inside the OnStart callback because
-		// it needs to receive the trades from the user data stream
-		//
-		// should try to avoid blocking the user data stream
-		// callbacks are blocking operation
-		session.UserDataStream.OnStart(func() {
-			s.logger.Infof("user data stream started, initializing grid...")
-
+		session.UserDataStream.OnAuth(func() {
+			s.logger.Infof("user data stream authenticated, start the process")
 			if !bbgo.IsBackTesting {
-				go time.AfterFunc(3*time.Second, func() {
-					s.startProcess(ctx, session)
+				time.AfterFunc(3*time.Second, func() {
+					if err := s.startProcess(ctx, session); err != nil {
+						return
+					}
+
+					s.recoverActiveOrdersPeriodically(ctx)
 				})
 			} else {
 				s.startProcess(ctx, session)
@@ -1986,21 +2000,10 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 		})
 	}
 
-	session.UserDataStream.OnConnect(func() {
-		if !bbgo.IsBackTesting {
-			// callback may block the stream execution, so we spawn the recover function to the background
-			// add (5 seconds + random <10 seconds jitter) delay
-			go time.AfterFunc(util.MillisecondsJitter(5*time.Second, 1000*10), func() {
-				s.recoverActiveOrders(ctx, session)
-			})
-		}
-	})
-
 	return nil
 }
 
-func (s *Strategy) startProcess(ctx context.Context, session *bbgo.ExchangeSession) {
-	s.debugGridProfitStats("startProcess")
+func (s *Strategy) startProcess(ctx context.Context, session *bbgo.ExchangeSession) error {
 	if s.RecoverOrdersWhenStart {
 		// do recover only when triggerPrice is not set and not in the back-test mode
 		s.logger.Infof("recoverWhenStart is set, trying to recover grid orders...")
@@ -2008,15 +2011,17 @@ func (s *Strategy) startProcess(ctx context.Context, session *bbgo.ExchangeSessi
 			// if recover fail, return and do not open grid
 			s.logger.WithError(err).Error("failed to start process, recover error")
 			s.EmitGridError(errors.Wrapf(err, "failed to start process, recover error"))
-			return
+			return err
 		}
 	}
 
 	// avoid using goroutine here for back-test
 	if err := s.openGrid(ctx, session); err != nil {
 		s.EmitGridError(errors.Wrapf(err, "failed to start process, setup grid orders error"))
-		return
+		return err
 	}
+
+	return nil
 }
 
 func (s *Strategy) recoverGrid(ctx context.Context, session *bbgo.ExchangeSession) error {
@@ -2160,17 +2165,12 @@ func (s *Strategy) recoverActiveOrders(ctx context.Context, session *bbgo.Exchan
 	}
 
 	s.logger.Infof("found %d active orders to update...", len(activeOrders))
-	for _, o := range activeOrders {
-		s.logger.Infof("updating %d order...", o.OrderID)
+	for i, o := range activeOrders {
+		s.logger.Infof("updating %d/%d order #%d...", i+1, len(activeOrders), o.OrderID)
 
-		var updatedOrder *types.Order
-		err := retry.GeneralBackoff(ctx, func() error {
-			var err error
-			updatedOrder, err = s.orderQueryService.QueryOrder(ctx, types.OrderQuery{
-				Symbol:  o.Symbol,
-				OrderID: strconv.FormatUint(o.OrderID, 10),
-			})
-			return err
+		updatedOrder, err := retry.QueryOrderUntilSuccessful(ctx, s.orderQueryService, types.OrderQuery{
+			Symbol:  o.Symbol,
+			OrderID: strconv.FormatUint(o.OrderID, 10),
 		})
 
 		if err != nil {
@@ -2178,6 +2178,7 @@ func (s *Strategy) recoverActiveOrders(ctx context.Context, session *bbgo.Exchan
 			return
 		}
 
+		s.logger.Infof("triggering updated order #%d: %s", o.OrderID, o.String())
 		activeOrderBook.Update(*updatedOrder)
 	}
 }

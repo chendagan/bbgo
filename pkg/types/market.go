@@ -47,11 +47,11 @@ type Market struct {
 	//    1.0 / math.Pow10(m.BaseUnitPrecision)
 	StepSize fixedpoint.Value `json:"stepSize,omitempty"`
 
-	MinPrice fixedpoint.Value `json:"minPrice,omitempty"`
-	MaxPrice fixedpoint.Value `json:"maxPrice,omitempty"`
-
 	// TickSize is the step size of price
 	TickSize fixedpoint.Value `json:"tickSize,omitempty"`
+
+	MinPrice fixedpoint.Value `json:"minPrice,omitempty"`
+	MaxPrice fixedpoint.Value `json:"maxPrice,omitempty"`
 }
 
 func (m Market) IsDustQuantity(quantity, price fixedpoint.Value) bool {
@@ -90,7 +90,9 @@ func (m Market) TruncateQuoteQuantity(quantity fixedpoint.Value) fixedpoint.Valu
 // when side = buy, then available = quote balance
 // The balance will be truncated first in order to calculate the minimal notional and minimal quantity
 // The adjusted (truncated) order quantity will be returned
-func (m Market) GreaterThanMinimalOrderQuantity(side SideType, price, available fixedpoint.Value) (fixedpoint.Value, bool) {
+func (m Market) GreaterThanMinimalOrderQuantity(
+	side SideType, price, available fixedpoint.Value,
+) (fixedpoint.Value, bool) {
 	switch side {
 	case SideTypeSell:
 		available = m.TruncateQuantity(available)
@@ -235,4 +237,9 @@ type MarketMap map[string]Market
 
 func (m MarketMap) Add(market Market) {
 	m[market.Symbol] = market
+}
+
+func (m MarketMap) Has(symbol string) bool {
+	_, ok := m[symbol]
+	return ok
 }

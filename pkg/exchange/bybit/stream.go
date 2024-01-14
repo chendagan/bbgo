@@ -8,16 +8,15 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 
 	"github.com/c9s/bbgo/pkg/exchange/bybit/bybitapi"
+	"github.com/c9s/bbgo/pkg/exchange/retry"
+	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
 const (
-	// Bybit: To avoid network or program issues, we recommend that you send the ping heartbeat packet every 20 seconds
-	// to maintain the WebSocket connection.
-	pingInterval = 20 * time.Second
-
 	// spotArgsLimit can input up to 10 args for each subscription request sent to one connection.
 	spotArgsLimit = 10
 )
@@ -25,22 +24,43 @@ const (
 var (
 	// wsAuthRequest specifies the duration for which a websocket request's authentication is valid.
 	wsAuthRequest = 10 * time.Second
+	// The default taker/maker fees can help us in estimating trading fees in the SPOT market, because trade fees are not
+	// provided for traditional accounts on Bybit.
+	// https://www.bybit.com/en-US/help-center/article/Trading-Fee-Structure
+	defaultTakerFee = fixedpoint.NewFromFloat(0.001)
+	defaultMakerFee = fixedpoint.NewFromFloat(0.001)
+
+	marketTradeLogLimiter = rate.NewLimiter(rate.Every(time.Minute), 1)
+	tradeLogLimiter       = rate.NewLimiter(rate.Every(time.Minute), 1)
+	orderLogLimiter       = rate.NewLimiter(rate.Every(time.Minute), 1)
+	kLineLogLimiter       = rate.NewLimiter(rate.Every(time.Minute), 1)
 )
 
-//go:generate mockgen -destination=mocks/stream.go -package=mocks . MarketInfoProvider
+// MarketInfoProvider calculates trade fees since trading fees are not supported by streaming.
 type MarketInfoProvider interface {
 	GetAllFeeRates(ctx context.Context) (bybitapi.FeeRates, error)
 	QueryMarkets(ctx context.Context) (types.MarketMap, error)
+}
+
+// AccountBalanceProvider provides a function to query all balances at streaming connected and emit balance snapshot.
+type AccountBalanceProvider interface {
+	QueryAccountBalances(ctx context.Context) (types.BalanceMap, error)
+}
+
+//go:generate mockgen -destination=mocks/stream.go -package=mocks . StreamDataProvider
+type StreamDataProvider interface {
+	MarketInfoProvider
+	AccountBalanceProvider
 }
 
 //go:generate callbackgen -type Stream
 type Stream struct {
 	types.StandardStream
 
-	key, secret    string
-	marketProvider MarketInfoProvider
-	// TODO: update the fee rate at 7:00 am UTC; rotation required.
-	symbolFeeDetails map[string]*symbolFeeDetail
+	key, secret        string
+	streamDataProvider StreamDataProvider
+	feeRateProvider    *feeRatePoller
+	marketsInfo        types.MarketMap
 
 	bookEventCallbacks        []func(e BookEvent)
 	marketTradeEventCallbacks []func(e []MarketTradeEvent)
@@ -50,21 +70,38 @@ type Stream struct {
 	tradeEventCallbacks       []func(e []TradeEvent)
 }
 
-func NewStream(key, secret string, marketProvider MarketInfoProvider) *Stream {
+func NewStream(key, secret string, userDataProvider StreamDataProvider) *Stream {
 	stream := &Stream{
 		StandardStream: types.NewStandardStream(),
 		// pragma: allowlist nextline secret
-		key:            key,
-		secret:         secret,
-		marketProvider: marketProvider,
+		key:                key,
+		secret:             secret,
+		streamDataProvider: userDataProvider,
+		feeRateProvider:    newFeeRatePoller(userDataProvider),
 	}
 
 	stream.SetEndpointCreator(stream.createEndpoint)
 	stream.SetParser(stream.parseWebSocketEvent)
 	stream.SetDispatcher(stream.dispatchEvent)
 	stream.SetHeartBeat(stream.ping)
-	stream.SetBeforeConnect(stream.getAllFeeRates)
+	stream.SetBeforeConnect(func(ctx context.Context) (err error) {
+		if stream.PublicOnly {
+			// we don't need the fee rate in the public stream.
+			return
+		}
+
+		// get account fee rate
+		go stream.feeRateProvider.Start(ctx)
+
+		stream.marketsInfo, err = stream.streamDataProvider.QueryMarkets(ctx)
+		if err != nil {
+			log.WithError(err).Error("failed to query market info before to connect stream")
+			return err
+		}
+		return nil
+	})
 	stream.OnConnect(stream.handlerConnect)
+	stream.OnAuth(stream.handleAuthEvent)
 
 	stream.OnBookEvent(stream.handleBookEvent)
 	stream.OnMarketTradeEvent(stream.handleMarketTradeEvent)
@@ -134,8 +171,8 @@ func (s *Stream) createEndpoint(_ context.Context) (string, error) {
 func (s *Stream) dispatchEvent(event interface{}) {
 	switch e := event.(type) {
 	case *WebSocketOpEvent:
-		if err := e.IsValid(); err != nil {
-			log.Errorf("invalid event: %v", err)
+		if e.IsAuthenticated() {
+			s.EmitAuth()
 		}
 
 	case *BookEvent:
@@ -169,6 +206,15 @@ func (s *Stream) parseWebSocketEvent(in []byte) (interface{}, error) {
 
 	switch {
 	case e.IsOp():
+		if err = e.IsValid(); err != nil {
+			log.Errorf("invalid event: %+v, err: %s", e, err)
+			return nil, err
+		}
+
+		// return global pong event to avoid emit raw message
+		if ok, pongEvent := e.toGlobalPongEventIfValid(); ok {
+			return pongEvent, nil
+		}
 		return e.WebSocketOpEvent, nil
 
 	case e.IsTopic():
@@ -228,40 +274,18 @@ func (s *Stream) parseWebSocketEvent(in []byte) (interface{}, error) {
 }
 
 // ping implements the Bybit text message of WebSocket PingPong.
-func (s *Stream) ping(ctx context.Context, conn *websocket.Conn, cancelFunc context.CancelFunc) {
-	defer func() {
-		log.Debug("[bybit] ping worker stopped")
-		cancelFunc()
-	}()
-
-	var pingTicker = time.NewTicker(pingInterval)
-	defer pingTicker.Stop()
-
-	for {
-		select {
-
-		case <-ctx.Done():
-			return
-
-		case <-s.CloseC:
-			return
-
-		case <-pingTicker.C:
-			// it's just for maintaining the liveliness of the connection, so comment out ReqId.
-			err := conn.WriteJSON(struct {
-				//ReqId string `json:"req_id"`
-				Op WsOpType `json:"op"`
-			}{
-				//ReqId: uuid.NewString(),
-				Op: WsOpTypePing,
-			})
-			if err != nil {
-				log.WithError(err).Error("ping error", err)
-				s.Reconnect()
-				return
-			}
-		}
+func (s *Stream) ping(conn *websocket.Conn) error {
+	err := conn.WriteJSON(struct {
+		Op WsOpType `json:"op"`
+	}{
+		Op: WsOpTypePing,
+	})
+	if err != nil {
+		log.WithError(err).Error("ping error")
+		return err
 	}
+
+	return nil
 }
 
 func (s *Stream) handlerConnect() {
@@ -302,8 +326,12 @@ func (s *Stream) convertSubscription(sub types.Subscription) (string, error) {
 
 	case types.BookChannel:
 		depth := types.DepthLevel1
-		if len(sub.Options.Depth) > 0 && sub.Options.Depth == types.DepthLevel50 {
-			depth = types.DepthLevel50
+
+		switch sub.Options.Depth {
+		case types.DepthLevel50:
+			depth = sub.Options.Depth
+		case types.DepthLevel200:
+			depth = sub.Options.Depth
 		}
 		return genTopic(TopicTypeOrderBook, depth, sub.Symbol), nil
 
@@ -323,6 +351,24 @@ func (s *Stream) convertSubscription(sub types.Subscription) (string, error) {
 	return "", fmt.Errorf("unsupported stream channel: %s", sub.Channel)
 }
 
+func (s *Stream) handleAuthEvent() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var balnacesMap types.BalanceMap
+	var err error
+	err = retry.GeneralBackoff(ctx, func() error {
+		balnacesMap, err = s.streamDataProvider.QueryAccountBalances(ctx)
+		return err
+	})
+	if err != nil {
+		log.WithError(err).Error("no more attempts to retrieve balances")
+		return
+	}
+
+	s.EmitBalanceSnapshot(balnacesMap)
+}
+
 func (s *Stream) handleBookEvent(e BookEvent) {
 	orderBook := e.OrderBook()
 	switch {
@@ -340,7 +386,9 @@ func (s *Stream) handleMarketTradeEvent(events []MarketTradeEvent) {
 	for _, event := range events {
 		trade, err := event.toGlobalTrade()
 		if err != nil {
-			log.WithError(err).Error("failed to convert to market trade")
+			if marketTradeLogLimiter.Allow() {
+				log.WithError(err).Error("failed to convert to market trade")
+			}
 			continue
 		}
 
@@ -349,7 +397,7 @@ func (s *Stream) handleMarketTradeEvent(events []MarketTradeEvent) {
 }
 
 func (s *Stream) handleWalletEvent(events []bybitapi.WalletBalances) {
-	s.StandardStream.EmitBalanceSnapshot(toGlobalBalanceMap(events))
+	s.StandardStream.EmitBalanceUpdate(toGlobalBalanceMap(events))
 }
 
 func (s *Stream) handleOrderEvent(events []OrderEvent) {
@@ -360,7 +408,9 @@ func (s *Stream) handleOrderEvent(events []OrderEvent) {
 
 		gOrder, err := toGlobalOrder(event.Order)
 		if err != nil {
-			log.WithError(err).Error("failed to convert to global order")
+			if orderLogLimiter.Allow() {
+				log.WithError(err).Error("failed to convert to global order")
+			}
 			continue
 		}
 		s.StandardStream.EmitOrderUpdate(*gOrder)
@@ -375,7 +425,9 @@ func (s *Stream) handleKLineEvent(klineEvent KLineEvent) {
 	for _, event := range klineEvent.KLines {
 		kline, err := event.toGlobalKLine(klineEvent.Symbol)
 		if err != nil {
-			log.WithError(err).Error("failed to convert to global k line")
+			if kLineLogLimiter.Allow() {
+				log.WithError(err).Error("failed to convert to global k line")
+			}
 			continue
 		}
 
@@ -389,67 +441,42 @@ func (s *Stream) handleKLineEvent(klineEvent KLineEvent) {
 
 func (s *Stream) handleTradeEvent(events []TradeEvent) {
 	for _, event := range events {
-		feeRate, found := s.symbolFeeDetails[event.Symbol]
+		feeRate, found := s.feeRateProvider.Get(event.Symbol)
 		if !found {
-			log.Warnf("unexpected symbol found, fee rate not supported, symbol: %s", event.Symbol)
-			continue
+			feeRate = symbolFeeDetail{
+				FeeRate: bybitapi.FeeRate{
+					Symbol:       event.Symbol,
+					TakerFeeRate: defaultTakerFee,
+					MakerFeeRate: defaultMakerFee,
+				},
+				BaseCoin:  "",
+				QuoteCoin: "",
+			}
+
+			if market, ok := s.marketsInfo[event.Symbol]; ok {
+				feeRate.BaseCoin = market.BaseCurrency
+				feeRate.QuoteCoin = market.QuoteCurrency
+			}
+
+			if tradeLogLimiter.Allow() {
+				// The error log level was utilized due to a detected discrepancy in the fee calculations.
+				log.Errorf("failed to get %s fee rate, use default taker fee %f, maker fee %f, base coin: %s, quote coin: %s",
+					event.Symbol,
+					feeRate.TakerFeeRate.Float64(),
+					feeRate.MakerFeeRate.Float64(),
+					feeRate.BaseCoin,
+					feeRate.QuoteCoin,
+				)
+			}
 		}
 
-		gTrade, err := event.toGlobalTrade(*feeRate)
+		gTrade, err := event.toGlobalTrade(feeRate)
 		if err != nil {
-			log.WithError(err).Errorf("unable to convert: %+v", event)
+			if tradeLogLimiter.Allow() {
+				log.WithError(err).Errorf("unable to convert: %+v", event)
+			}
 			continue
 		}
 		s.StandardStream.EmitTradeUpdate(*gTrade)
 	}
-}
-
-type symbolFeeDetail struct {
-	bybitapi.FeeRate
-
-	BaseCoin  string
-	QuoteCoin string
-}
-
-// getAllFeeRates retrieves all fee rates from the Bybit API and then fetches markets to ensure the base coin and quote coin
-// are correct.
-func (e *Stream) getAllFeeRates(ctx context.Context) error {
-	feeRates, err := e.marketProvider.GetAllFeeRates(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to call get fee rates: %w", err)
-	}
-
-	symbolMap := map[string]*symbolFeeDetail{}
-	for _, f := range feeRates.List {
-		if _, found := symbolMap[f.Symbol]; !found {
-			symbolMap[f.Symbol] = &symbolFeeDetail{FeeRate: f}
-		}
-	}
-
-	mkts, err := e.marketProvider.QueryMarkets(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get markets: %w", err)
-	}
-
-	// update base coin, quote coin into symbolFeeDetail
-	for _, mkt := range mkts {
-		feeRate, found := symbolMap[mkt.Symbol]
-		if !found {
-			continue
-		}
-
-		feeRate.BaseCoin = mkt.BaseCurrency
-		feeRate.QuoteCoin = mkt.QuoteCurrency
-	}
-
-	// remove trading pairs that are not present in spot market.
-	for k, v := range symbolMap {
-		if len(v.BaseCoin) == 0 || len(v.QuoteCoin) == 0 {
-			log.Debugf("related market not found: %s, skipping the associated trade", k)
-			delete(symbolMap, k)
-		}
-	}
-
-	e.symbolFeeDetails = symbolMap
-	return nil
 }

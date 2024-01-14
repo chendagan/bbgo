@@ -26,15 +26,15 @@ const (
 )
 
 // https://bybit-exchange.github.io/docs/zh-TW/v5/rate-limit
-// sharedRateLimiter indicates that the API belongs to the public API.
-//
-// The default order limiter apply 5 requests per second and a 5 initial bucket
-// this includes QueryMarkets, QueryTicker, QueryAccountBalances, GetFeeRates
+// GET/POST method (shared): 120 requests per second for 5 consecutive seconds
 var (
-	sharedRateLimiter       = rate.NewLimiter(rate.Every(time.Second/5), 5)
-	tradeRateLimiter        = rate.NewLimiter(rate.Every(time.Second/5), 5)
-	orderRateLimiter        = rate.NewLimiter(rate.Every(100*time.Millisecond), 10)
-	closedOrderQueryLimiter = rate.NewLimiter(rate.Every(time.Second), 1)
+	// sharedRateLimiter indicates that the API belongs to the public API.
+	// The default order limiter apply 5 requests per second and a 5 initial bucket
+	// this includes QueryMarkets, QueryTicker, QueryAccountBalances, GetFeeRates
+	sharedRateLimiter          = rate.NewLimiter(rate.Every(time.Second/5), 5)
+	queryOrderTradeRateLimiter = rate.NewLimiter(rate.Every(time.Second/5), 5)
+	orderRateLimiter           = rate.NewLimiter(rate.Every(time.Second/10), 10)
+	closedOrderQueryLimiter    = rate.NewLimiter(rate.Every(time.Second), 1)
 
 	log = logrus.WithFields(logrus.Fields{
 		"exchange": "bybit",
@@ -159,7 +159,7 @@ func (e *Exchange) QueryOpenOrders(ctx context.Context, symbol string) (orders [
 			req = req.Cursor(cursor)
 		}
 
-		if err = tradeRateLimiter.Wait(ctx); err != nil {
+		if err = queryOrderTradeRateLimiter.Wait(ctx); err != nil {
 			return nil, fmt.Errorf("place order rate limiter wait error: %w", err)
 		}
 		res, err := req.Do(ctx)
@@ -232,7 +232,7 @@ func (e *Exchange) QueryOrderTrades(ctx context.Context, q types.OrderQuery) (tr
 		req.Symbol(q.Symbol)
 	}
 
-	if err := tradeRateLimiter.Wait(ctx); err != nil {
+	if err := queryOrderTradeRateLimiter.Wait(ctx); err != nil {
 		return nil, fmt.Errorf("trade rate limiter wait error: %w", err)
 	}
 	response, err := req.Do(ctx)
@@ -429,34 +429,31 @@ If options.StartTime is not specified, you can only query for records in the las
 If you want to query for records older than 7 days, options.StartTime is required.
 It supports to query records up to 180 days.
 
-If the orderId is null, fromTradeId is passed, and toTradeId is null, then the result is sorted by
-ticketId in ascend. Otherwise, the result is sorted by ticketId in descend.
-
 ** Here includes MakerRebate. If needed, let's discuss how to modify it to return in trade. **
 ** StartTime and EndTime are inclusive. **
 ** StartTime and EndTime cannot exceed 180 days. **
+** StartTime, EndTime, FromTradeId can be used together. **
+** If the `FromTradeId` is passed, and `ToTradeId` is null, then the result is sorted by tradeId in `ascend`.
+Otherwise, the result is sorted by tradeId in `descend`. **
 */
 func (e *Exchange) QueryTrades(ctx context.Context, symbol string, options *types.TradeQueryOptions) (trades []types.Trade, err error) {
-	if options.StartTime != nil && options.EndTime != nil && options.EndTime.Sub(*options.StartTime) > halfYearDuration {
-		return nil, fmt.Errorf("StartTime and EndTime cannot exceed 180 days, startTime: %v, endTime: %v, diff: %v",
-			options.StartTime.String(),
-			options.EndTime.String(),
-			options.EndTime.Sub(*options.StartTime)/24)
-	}
-
 	// using v3 client, since the v5 API does not support feeCurrency.
 	req := e.v3client.NewGetTradesRequest()
 	req.Symbol(symbol)
 
-	if options.StartTime != nil || options.EndTime != nil {
-		if options.StartTime != nil {
-			req.StartTime(options.StartTime.UTC())
-		}
-		if options.EndTime != nil {
-			req.EndTime(options.EndTime.UTC())
-		}
-	} else {
-		req.FromTradeId(strconv.FormatUint(options.LastTradeID, 10))
+	// If `lastTradeId` is given and greater than 0, the query will use it as a condition and the retrieved result will be
+	// in `ascending` order. We can use `lastTradeId` to retrieve all the data. So we hack it to '1' if `lastTradeID` is '0'.
+	// If 0 is given, it will not be used as a condition and the result will be in `descending` order. The FromTradeId
+	// option cannot be used to retrieve more data.
+	req.FromTradeId(strconv.FormatUint(options.LastTradeID, 10))
+	if options.LastTradeID == 0 {
+		req.FromTradeId("1")
+	}
+	if options.StartTime != nil {
+		req.StartTime(options.StartTime.UTC())
+	}
+	if options.EndTime != nil {
+		req.EndTime(options.EndTime.UTC())
 	}
 
 	limit := uint64(options.Limit)
@@ -466,7 +463,7 @@ func (e *Exchange) QueryTrades(ctx context.Context, symbol string, options *type
 	}
 	req.Limit(limit)
 
-	if err := tradeRateLimiter.Wait(ctx); err != nil {
+	if err := queryOrderTradeRateLimiter.Wait(ctx); err != nil {
 		return nil, fmt.Errorf("trade rate limiter wait error: %w", err)
 	}
 	response, err := req.Do(ctx)

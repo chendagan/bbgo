@@ -42,6 +42,14 @@ type Stream interface {
 	Close() error
 }
 
+type PrivateChannelSetter interface {
+	SetPrivateChannels(channels []string)
+}
+
+type PrivateChannelSymbolSetter interface {
+	SetPrivateChannelSymbols(symbols []string)
+}
+
 type Unsubscriber interface {
 	// Unsubscribe unsubscribes the all subscriptions.
 	Unsubscribe()
@@ -53,10 +61,12 @@ type Parser func(message []byte) (interface{}, error)
 
 type Dispatcher func(e interface{})
 
-// HeartBeat keeps connection alive by sending the heartbeat packet.
-type HeartBeat func(ctxConn context.Context, conn *websocket.Conn, cancelConn context.CancelFunc)
+// HeartBeat keeps connection alive by sending the ping packet.
+type HeartBeat func(conn *websocket.Conn) error
 
 type BeforeConnect func(ctx context.Context) error
+
+type WebsocketPongEvent struct{}
 
 //go:generate callbackgen -type StandardStream -interface
 type StandardStream struct {
@@ -80,6 +90,11 @@ type StandardStream struct {
 
 	PublicOnly bool
 
+	// sg is used to wait until the previous routines are closed.
+	// only handle routines used internally, avoid including external callback func to prevent issues if they have
+	// bugs and cannot terminate.
+	sg SyncGroup
+
 	// ReconnectC is a signal channel for reconnecting
 	ReconnectC chan struct{}
 
@@ -97,6 +112,10 @@ type StandardStream struct {
 	connectCallbacks []func()
 
 	disconnectCallbacks []func()
+
+	authCallbacks []func()
+
+	rawMessageCallbacks []func(raw []byte)
 
 	// private trade update callbacks
 	tradeUpdateCallbacks []func(trade Trade)
@@ -123,6 +142,8 @@ type StandardStream struct {
 
 	aggTradeCallbacks []func(trade Trade)
 
+	forceOrderCallbacks []func(info LiquidationInfo)
+
 	// Futures
 	FuturesPositionUpdateCallbacks []func(futuresPositions FuturesPositionMap)
 
@@ -138,6 +159,7 @@ type StandardStreamEmitter interface {
 	EmitStart()
 	EmitConnect()
 	EmitDisconnect()
+	EmitAuth()
 	EmitTradeUpdate(Trade)
 	EmitOrderUpdate(Order)
 	EmitBalanceSnapshot(BalanceMap)
@@ -149,6 +171,7 @@ type StandardStreamEmitter interface {
 	EmitBookSnapshot(SliceOrderBook)
 	EmitMarketTrade(Trade)
 	EmitAggTrade(Trade)
+	EmitForceOrder(LiquidationInfo)
 	EmitFuturesPositionUpdate(FuturesPositionMap)
 	EmitFuturesPositionSnapshot(FuturesPositionMap)
 }
@@ -157,6 +180,7 @@ func NewStandardStream() StandardStream {
 	return StandardStream{
 		ReconnectC: make(chan struct{}, 1),
 		CloseC:     make(chan struct{}),
+		sg:         NewSyncGroup(),
 	}
 }
 
@@ -185,9 +209,10 @@ func (s *StandardStream) SetConn(ctx context.Context, conn *websocket.Conn) (con
 	connCtx, connCancel := context.WithCancel(ctx)
 	s.ConnLock.Lock()
 
-	// ensure the previous context is cancelled
+	// ensure the previous context is cancelled and all routines are closed.
 	if s.ConnCancel != nil {
 		s.ConnCancel()
+		s.sg.WaitAndClear()
 	}
 
 	// create a new context for this connection
@@ -207,6 +232,9 @@ func (s *StandardStream) Read(ctx context.Context, conn *websocket.Conn, cancel 
 	// flag format: debug-{component}-{message type}
 	debugRawMessage := viper.GetBool("debug-websocket-raw-message")
 
+	hasParser := s.parser != nil
+	hasDispatcher := s.dispatcher != nil
+
 	for {
 		select {
 
@@ -224,12 +252,12 @@ func (s *StandardStream) Read(ctx context.Context, conn *websocket.Conn, cancel 
 			mt, message, err := conn.ReadMessage()
 			if err != nil {
 				// if it's a network timeout error, we should re-connect
-				switch err := err.(type) {
+				switch err2 := err.(type) {
 
 				// if it's a websocket related error
 				case *websocket.CloseError:
-					if err.Code != websocket.CloseNormalClosure {
-						log.WithError(err).Errorf("websocket error abnormal close: %+v", err)
+					if err2.Code != websocket.CloseNormalClosure {
+						log.WithError(err2).Warnf("websocket error abnormal close: %+v", err2)
 					}
 
 					_ = conn.Close()
@@ -239,13 +267,13 @@ func (s *StandardStream) Read(ctx context.Context, conn *websocket.Conn, cancel 
 					return
 
 				case net.Error:
-					log.WithError(err).Warn("websocket read network error")
+					log.WithError(err2).Warn("websocket read network error")
 					_ = conn.Close()
 					s.Reconnect()
 					return
 
 				default:
-					log.WithError(err).Warn("unexpected websocket error")
+					log.WithError(err2).Warn("unexpected websocket error")
 					_ = conn.Close()
 					s.Reconnect()
 					return
@@ -261,23 +289,35 @@ func (s *StandardStream) Read(ctx context.Context, conn *websocket.Conn, cancel 
 				log.Info(string(message))
 			}
 
-			var e interface{}
-			if s.parser != nil {
-				e, err = s.parser(message)
-				if err != nil {
-					log.WithError(err).Errorf("websocket event parse error, message: %s", message)
-					continue
-				}
+			if !hasParser {
+				s.EmitRawMessage(message)
+				continue
 			}
 
-			if s.dispatcher != nil {
+			var e interface{}
+			e, err = s.parser(message)
+			if err != nil {
+				log.WithError(err).Errorf("websocket event parse error, message: %s", message)
+				// emit raw message even if occurs error, because we want anything can be detected
+				s.EmitRawMessage(message)
+				continue
+			}
+
+			// skip pong event to avoid the message like spam
+			if _, ok := e.(*WebsocketPongEvent); !ok {
+				s.EmitRawMessage(message)
+			}
+
+			if hasDispatcher {
 				s.dispatcher(e)
 			}
 		}
 	}
 }
 
-func (s *StandardStream) ping(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc, interval time.Duration) {
+func (s *StandardStream) ping(
+	ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc, interval time.Duration,
+) {
 	defer func() {
 		cancel()
 		log.Debug("[websocket] ping worker stopped")
@@ -296,6 +336,14 @@ func (s *StandardStream) ping(ctx context.Context, conn *websocket.Conn, cancel 
 			return
 
 		case <-pingTicker.C:
+			if s.heartBeat != nil {
+				if err := s.heartBeat(conn); err != nil {
+					// log errors at the concrete class so that we can identify which exchange encountered an error
+					s.Reconnect()
+					return
+				}
+			}
+
 			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout)); err != nil {
 				log.WithError(err).Error("ping error", err)
 				s.Reconnect()
@@ -402,11 +450,13 @@ func (s *StandardStream) DialAndConnect(ctx context.Context) error {
 	connCtx, connCancel := s.SetConn(ctx, conn)
 	s.EmitConnect()
 
-	go s.Read(connCtx, conn, connCancel)
-	go s.ping(connCtx, conn, connCancel, pingInterval)
-	if s.heartBeat != nil {
-		go s.heartBeat(connCtx, conn, connCancel)
-	}
+	s.sg.Add(func() {
+		s.Read(connCtx, conn, connCancel)
+	})
+	s.sg.Add(func() {
+		s.ping(connCtx, conn, connCancel, pingInterval)
+	})
+	s.sg.Run()
 	return nil
 }
 
@@ -493,8 +543,11 @@ const (
 	DepthLevelMedium Depth = "MEDIUM"
 	DepthLevel1      Depth = "1"
 	DepthLevel5      Depth = "5"
+	DepthLevel15     Depth = "15"
 	DepthLevel20     Depth = "20"
 	DepthLevel50     Depth = "50"
+	DepthLevel200    Depth = "200"
+	DepthLevel400    Depth = "400"
 )
 
 type Speed string

@@ -2,7 +2,6 @@ package bybit
 
 import (
 	"fmt"
-	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -67,8 +66,8 @@ func TestToGlobalMarket(t *testing.T) {
 	exp := types.Market{
 		Symbol:          inst.Symbol,
 		LocalSymbol:     inst.Symbol,
-		PricePrecision:  int(math.Log10(inst.LotSizeFilter.QuotePrecision.Float64())),
-		VolumePrecision: int(math.Log10(inst.LotSizeFilter.BasePrecision.Float64())),
+		PricePrecision:  8,
+		VolumePrecision: 6,
 		QuoteCurrency:   inst.QuoteCoin,
 		BaseCurrency:    inst.BaseCoin,
 		MinNotional:     inst.LotSizeFilter.MinOrderAmt,
@@ -837,7 +836,7 @@ func Test_toGlobalKLines(t *testing.T) {
 			Exchange:    types.ExchangeBybit,
 			Symbol:      resp.Symbol,
 			StartTime:   types.Time(resp.List[0].StartTime.Time()),
-			EndTime:     types.Time(resp.List[0].StartTime.Time().Add(interval.Duration())),
+			EndTime:     types.Time(resp.List[0].StartTime.Time().Add(interval.Duration() - time.Millisecond)),
 			Interval:    interval,
 			Open:        fixedpoint.NewFromFloat(29045.3),
 			Close:       fixedpoint.NewFromFloat(29228.56),
@@ -851,7 +850,7 @@ func Test_toGlobalKLines(t *testing.T) {
 			Exchange:    types.ExchangeBybit,
 			Symbol:      resp.Symbol,
 			StartTime:   types.Time(resp.List[1].StartTime.Time()),
-			EndTime:     types.Time(resp.List[1].StartTime.Time().Add(interval.Duration())),
+			EndTime:     types.Time(resp.List[1].StartTime.Time().Add(interval.Duration() - time.Millisecond)),
 			Interval:    interval,
 			Open:        fixedpoint.NewFromFloat(29167.33),
 			Close:       fixedpoint.NewFromFloat(29045.3),

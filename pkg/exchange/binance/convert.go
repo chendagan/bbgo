@@ -177,6 +177,7 @@ func toGlobalOrder(binanceOrder *binance.Order, isMargin bool) (*types.Order, er
 		IsWorking:        binanceOrder.IsWorking,
 		OrderID:          uint64(binanceOrder.OrderID),
 		Status:           toGlobalOrderStatus(binanceOrder.Status),
+		OriginalStatus:   string(binanceOrder.Status),
 		ExecutedQuantity: fixedpoint.MustNewFromString(binanceOrder.ExecutedQuantity),
 		CreationTime:     types.Time(millisecondTime(binanceOrder.Time)),
 		UpdateTime:       types.Time(millisecondTime(binanceOrder.UpdateTime)),
@@ -228,7 +229,7 @@ func toGlobalTrade(t binance.TradeV3, isMargin bool) (*types.Trade, error) {
 		OrderID:       uint64(t.OrderID),
 		Price:         price,
 		Symbol:        t.Symbol,
-		Exchange:      "binance",
+		Exchange:      types.ExchangeBinance,
 		Quantity:      quantity,
 		QuoteQuantity: quoteQuantity,
 		Side:          side,
@@ -340,6 +341,8 @@ func convertSubscription(s types.Subscription) string {
 		return fmt.Sprintf("%s@trade", strings.ToLower(s.Symbol))
 	case types.AggTradeChannel:
 		return fmt.Sprintf("%s@aggTrade", strings.ToLower(s.Symbol))
+	case types.ForceOrderChannel:
+		return fmt.Sprintf("%s@forceOrder", strings.ToLower(s.Symbol))
 	}
 
 	return fmt.Sprintf("%s@%s", strings.ToLower(s.Symbol), s.Channel)

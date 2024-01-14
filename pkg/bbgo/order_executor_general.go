@@ -68,7 +68,13 @@ type GeneralOrderExecutor struct {
 	disableNotify bool
 }
 
-func NewGeneralOrderExecutor(session *ExchangeSession, symbol, strategy, strategyInstanceID string, position *types.Position) *GeneralOrderExecutor {
+// NewGeneralOrderExecutor allocates a GeneralOrderExecutor
+// which has its own order store, trade collector
+func NewGeneralOrderExecutor(
+	session *ExchangeSession,
+	symbol, strategy, strategyInstanceID string,
+	position *types.Position,
+) *GeneralOrderExecutor {
 	// Always update the position fields
 	position.Strategy = strategy
 	position.StrategyInstanceID = strategyInstanceID
@@ -114,10 +120,12 @@ func (e *GeneralOrderExecutor) startMarginAssetUpdater(ctx context.Context) {
 	go e.marginAssetMaxBorrowableUpdater(ctx, 30*time.Minute, marginService, e.position.Market)
 }
 
-func (e *GeneralOrderExecutor) updateMarginAssetMaxBorrowable(ctx context.Context, marginService types.MarginBorrowRepayService, market types.Market) {
+func (e *GeneralOrderExecutor) updateMarginAssetMaxBorrowable(
+	ctx context.Context, marginService types.MarginBorrowRepayService, market types.Market,
+) {
 	maxBorrowable, err := marginService.QueryMarginAssetMaxBorrowable(ctx, market.BaseCurrency)
 	if err != nil {
-		log.WithError(err).Errorf("can not query margin base asset %s max borrowable", market.BaseCurrency)
+		log.WithError(err).Warnf("can not query margin base asset %s max borrowable", market.BaseCurrency)
 	} else {
 		log.Infof("updating margin base asset %s max borrowable amount: %f", market.BaseCurrency, maxBorrowable.Float64())
 		e.marginBaseMaxBorrowable = maxBorrowable
@@ -125,14 +133,16 @@ func (e *GeneralOrderExecutor) updateMarginAssetMaxBorrowable(ctx context.Contex
 
 	maxBorrowable, err = marginService.QueryMarginAssetMaxBorrowable(ctx, market.QuoteCurrency)
 	if err != nil {
-		log.WithError(err).Errorf("can not query margin quote asset %s max borrowable", market.QuoteCurrency)
+		log.WithError(err).Warnf("can not query margin quote asset %s max borrowable", market.QuoteCurrency)
 	} else {
 		log.Infof("updating margin quote asset %s max borrowable amount: %f", market.QuoteCurrency, maxBorrowable.Float64())
 		e.marginQuoteMaxBorrowable = maxBorrowable
 	}
 }
 
-func (e *GeneralOrderExecutor) marginAssetMaxBorrowableUpdater(ctx context.Context, interval time.Duration, marginService types.MarginBorrowRepayService, market types.Market) {
+func (e *GeneralOrderExecutor) marginAssetMaxBorrowableUpdater(
+	ctx context.Context, interval time.Duration, marginService types.MarginBorrowRepayService, market types.Market,
+) {
 	t := time.NewTicker(util.MillisecondsJitter(interval, 500))
 	defer t.Stop()
 
@@ -212,7 +222,9 @@ func (e *GeneralOrderExecutor) SetLogger(logger log.FieldLogger) {
 	e.logger = logger
 }
 
-func (e *GeneralOrderExecutor) SubmitOrders(ctx context.Context, submitOrders ...types.SubmitOrder) (types.OrderSlice, error) {
+func (e *GeneralOrderExecutor) SubmitOrders(
+	ctx context.Context, submitOrders ...types.SubmitOrder,
+) (types.OrderSlice, error) {
 	formattedOrders, err := e.session.FormatOrders(submitOrders)
 	if err != nil {
 		return nil, err
@@ -268,7 +280,9 @@ type OpenPositionOptions struct {
 	Tags  []string         `json:"-" yaml:"-"`
 }
 
-func (e *GeneralOrderExecutor) reduceQuantityAndSubmitOrder(ctx context.Context, price fixedpoint.Value, submitOrder types.SubmitOrder) (types.OrderSlice, error) {
+func (e *GeneralOrderExecutor) reduceQuantityAndSubmitOrder(
+	ctx context.Context, price fixedpoint.Value, submitOrder types.SubmitOrder,
+) (types.OrderSlice, error) {
 	var err error
 	for i := 0; i < submitOrderRetryLimit; i++ {
 		q := submitOrder.Quantity.Mul(fixedpoint.One.Sub(quantityReduceDelta))
@@ -309,7 +323,9 @@ func (e *GeneralOrderExecutor) reduceQuantityAndSubmitOrder(ctx context.Context,
 // @param options: OpenPositionOptions to control the generated SubmitOrder in a higher level way. Notice that the Price in options will be updated as the submitOrder price.
 // @return *types.SubmitOrder: SubmitOrder with calculated quantity and price.
 // @return error: Error message.
-func (e *GeneralOrderExecutor) NewOrderFromOpenPosition(ctx context.Context, options *OpenPositionOptions) (*types.SubmitOrder, error) {
+func (e *GeneralOrderExecutor) NewOrderFromOpenPosition(
+	ctx context.Context, options *OpenPositionOptions,
+) (*types.SubmitOrder, error) {
 	price := options.Price
 	submitOrder := types.SubmitOrder{
 		Symbol:           e.position.Symbol,
@@ -408,7 +424,9 @@ func (e *GeneralOrderExecutor) NewOrderFromOpenPosition(ctx context.Context, opt
 // @param options: OpenPositionOptions to control the generated SubmitOrder in a higher level way. Notice that the Price in options will be updated as the submitOrder price.
 // @return types.OrderSlice: Created orders with information from exchange.
 // @return error: Error message.
-func (e *GeneralOrderExecutor) OpenPosition(ctx context.Context, options OpenPositionOptions) (types.OrderSlice, error) {
+func (e *GeneralOrderExecutor) OpenPosition(
+	ctx context.Context, options OpenPositionOptions,
+) (types.OrderSlice, error) {
 	if e.position.IsClosing() {
 		return nil, errors.Wrap(ErrPositionAlreadyClosing, "unable to open position")
 	}

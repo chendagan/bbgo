@@ -69,13 +69,16 @@ func (s *Strategy) Initialize(ctx context.Context, environ *bbgo.Environment, se
 	s.OrderExecutor.BindEnvironment(environ)
 	s.OrderExecutor.BindProfitStats(s.ProfitStats)
 	s.OrderExecutor.Bind()
-	s.OrderExecutor.TradeCollector().OnPositionUpdate(func(position *types.Position) {
-		// bbgo.Sync(ctx, s)
-	})
+	/*
+		s.OrderExecutor.TradeCollector().OnPositionUpdate(func(position *types.Position) {
+			bbgo.Sync(ctx, s)
+		})
+	*/
 
 	if !s.PositionHardLimit.IsZero() && !s.MaxPositionQuantity.IsZero() {
 		log.Infof("positionHardLimit and maxPositionQuantity are configured, setting up PositionRiskControl...")
 		s.positionRiskControl = riskcontrol.NewPositionRiskControl(s.OrderExecutor, s.PositionHardLimit, s.MaxPositionQuantity)
+		s.positionRiskControl.Initialize(ctx, session)
 	}
 
 	if !s.CircuitBreakLossThreshold.IsZero() {
@@ -87,4 +90,11 @@ func (s *Strategy) Initialize(ctx context.Context, environ *bbgo.Environment, se
 			s.ProfitStats,
 			24*time.Hour)
 	}
+}
+
+func (s *Strategy) IsHalted(t time.Time) bool {
+	if s.circuitBreakRiskControl == nil {
+		return false
+	}
+	return s.circuitBreakRiskControl.IsHalted(t)
 }

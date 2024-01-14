@@ -65,6 +65,20 @@ type Position struct {
 
 	// Modify position callbacks
 	modifyCallbacks []func(baseQty fixedpoint.Value, quoteQty fixedpoint.Value, price fixedpoint.Value)
+
+	// ttl is the ttl to keep in persistence
+	ttl time.Duration
+}
+
+func (s *Position) SetTTL(ttl time.Duration) {
+	if ttl.Nanoseconds() <= 0 {
+		return
+	}
+	s.ttl = ttl
+}
+
+func (s *Position) Expiration() time.Duration {
+	return s.ttl
 }
 
 func (p *Position) CsvHeader() []string {
@@ -192,6 +206,8 @@ func (p *Position) GetBase() (base fixedpoint.Value) {
 	return base
 }
 
+// GetQuantity calls GetBase() and then convert the number into a positive number
+// that could be treated as a quantity.
 func (p *Position) GetQuantity() fixedpoint.Value {
 	base := p.GetBase()
 	return base.Abs()

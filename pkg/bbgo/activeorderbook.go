@@ -3,19 +3,17 @@ package bbgo
 import (
 	"context"
 	"encoding/json"
-	"sort"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/c9s/bbgo/pkg/core"
 	"github.com/c9s/bbgo/pkg/sigchan"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
-const CancelOrderWaitTime = 20 * time.Millisecond
+const DefaultCancelOrderWaitTime = 20 * time.Millisecond
 
 // ActiveOrderBook manages the local active order books.
 //
@@ -35,6 +33,8 @@ type ActiveOrderBook struct {
 	C sigchan.Chan
 
 	mu sync.Mutex
+
+	cancelOrderWaitTime time.Duration
 }
 
 func NewActiveOrderBook(symbol string) *ActiveOrderBook {
@@ -43,7 +43,12 @@ func NewActiveOrderBook(symbol string) *ActiveOrderBook {
 		orders:              types.NewSyncOrderMap(),
 		pendingOrderUpdates: types.NewSyncOrderMap(),
 		C:                   sigchan.New(1),
+		cancelOrderWaitTime: DefaultCancelOrderWaitTime,
 	}
+}
+
+func (b *ActiveOrderBook) SetCancelOrderWaitTime(duration time.Duration) {
+	b.cancelOrderWaitTime = duration
 }
 
 func (b *ActiveOrderBook) MarshalJSON() ([]byte, error) {
@@ -59,7 +64,9 @@ func (b *ActiveOrderBook) BindStream(stream types.Stream) {
 	stream.OnOrderUpdate(b.orderUpdateHandler)
 }
 
-func (b *ActiveOrderBook) waitClear(ctx context.Context, order types.Order, waitTime, timeout time.Duration) (bool, error) {
+func (b *ActiveOrderBook) waitClear(
+	ctx context.Context, order types.Order, waitTime, timeout time.Duration,
+) (bool, error) {
 	if !b.orders.Exists(order.OrderID) {
 		return true, nil
 	}
@@ -155,10 +162,14 @@ func (b *ActiveOrderBook) FastCancel(ctx context.Context, ex types.Exchange, ord
 }
 
 // GracefulCancel cancels the active orders gracefully
-func (b *ActiveOrderBook) GracefulCancel(ctx context.Context, ex types.Exchange, orders ...types.Order) error {
+func (b *ActiveOrderBook) GracefulCancel(ctx context.Context, ex types.Exchange, specifiedOrders ...types.Order) error {
+	cancelAll := false
+	orders := specifiedOrders
+
 	// if no orders are given, set to cancelAll
-	if len(orders) == 0 {
+	if len(specifiedOrders) == 0 {
 		orders = b.Orders()
+		cancelAll = true
 	} else {
 		// simple check on given input
 		hasSymbol := b.Symbol != ""
@@ -168,16 +179,18 @@ func (b *ActiveOrderBook) GracefulCancel(ctx context.Context, ex types.Exchange,
 			}
 		}
 	}
+
 	// optimize order cancel for back-testing
 	if IsBackTesting {
 		return ex.CancelOrders(context.Background(), orders...)
 	}
 
 	log.Debugf("[ActiveOrderBook] gracefully cancelling %s orders...", b.Symbol)
-	waitTime := CancelOrderWaitTime
+	waitTime := b.cancelOrderWaitTime
+	orderCancelTimeout := 5 * time.Second
 
 	startTime := time.Now()
-	// ensure every order is cancelled
+	// ensure every order is canceled
 	for {
 		// Some orders in the variable are not created on the server side yet,
 		// If we cancel these orders directly, we will get an unsent order error
@@ -186,48 +199,68 @@ func (b *ActiveOrderBook) GracefulCancel(ctx context.Context, ex types.Exchange,
 
 		// since ctx might be canceled, we should use background context here
 		if err := ex.CancelOrders(context.Background(), orders...); err != nil {
-			log.WithError(err).Errorf("[ActiveOrderBook] can not cancel %s orders", b.Symbol)
+			log.WithError(err).Warnf("[ActiveOrderBook] can not cancel %s orders", b.Symbol)
 		}
 
 		log.Debugf("[ActiveOrderBook] waiting %s for %s orders to be cancelled...", waitTime, b.Symbol)
 
-		clear, err := b.waitAllClear(ctx, waitTime, 5*time.Second)
-		if clear || err != nil {
-			break
-		}
+		if cancelAll {
+			clear, err := b.waitAllClear(ctx, waitTime, orderCancelTimeout)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					log.WithError(err).Errorf("order cancel error")
+				}
 
-		log.Warnf("[ActiveOrderBook] %d %s orders are not cancelled yet:", b.NumOfOrders(), b.Symbol)
-		b.Print()
+				break
+			}
+
+			if clear {
+				log.Debugf("[ActiveOrderBook] %s orders are canceled", b.Symbol)
+				break
+			}
+
+			log.Warnf("[ActiveOrderBook] %d %s orders are not cancelled yet:", b.NumOfOrders(), b.Symbol)
+			b.Print()
+
+		} else {
+			existingOrders := b.filterExistingOrders(orders)
+			if len(existingOrders) == 0 {
+				log.Debugf("[ActiveOrderBook] orders are canceled")
+				break
+			}
+		}
 
 		// verify the current open orders via the RESTful API
-		log.Warnf("[ActiveOrderBook] using REStful API to verify active orders...")
+		log.Warnf("[ActiveOrderBook] using open orders API to verify the active orders...")
 
-		var symbols = map[string]struct{}{}
-		for _, order := range orders {
-			symbols[order.Symbol] = struct{}{}
+		var symbolOrdersMap = categorizeOrderBySymbol(orders)
 
-		}
-		var leftOrders []types.Order
+		var leftOrders types.OrderSlice
+		for symbol := range symbolOrdersMap {
+			symbolOrders, ok := symbolOrdersMap[symbol]
+			if !ok {
+				continue
+			}
 
-		for symbol := range symbols {
 			openOrders, err := ex.QueryOpenOrders(ctx, symbol)
 			if err != nil {
 				log.WithError(err).Errorf("can not query %s open orders", symbol)
 				continue
 			}
 
-			openOrderStore := core.NewOrderStore(symbol)
-			openOrderStore.Add(openOrders...)
-			for _, o := range orders {
-				// if it's not on the order book (open orders), we should remove it from our local side
-				if !openOrderStore.Exists(o.OrderID) {
+			openOrderMap := types.NewOrderMap(openOrders...)
+			for _, o := range symbolOrders {
+				// if it's not on the order book (open orders),
+				// we should remove it from our local side
+				if !openOrderMap.Exists(o.OrderID) {
 					b.Remove(o)
 				} else {
-					leftOrders = append(leftOrders, o)
+					leftOrders.Add(o)
 				}
 			}
 		}
 
+		// update order slice for the next try
 		orders = leftOrders
 	}
 
@@ -241,17 +274,8 @@ func (b *ActiveOrderBook) orderUpdateHandler(order types.Order) {
 
 func (b *ActiveOrderBook) Print() {
 	orders := b.orders.Orders()
-
-	// sort orders by price
-	sort.Slice(orders, func(i, j int) bool {
-		o1 := orders[i]
-		o2 := orders[j]
-		return o1.Price.Compare(o2.Price) > 0
-	})
-
-	for _, o := range orders {
-		log.Infof("%s", o)
-	}
+	orders = types.SortOrdersByPrice(orders, true)
+	orders.Print()
 }
 
 // Update updates the order by the order status and emit the related events.
@@ -266,6 +290,7 @@ func (b *ActiveOrderBook) Update(order types.Order) {
 
 	b.mu.Lock()
 	if !b.orders.Exists(order.OrderID) {
+		log.Debugf("[ActiveOrderBook] order #%d %s does not exist, adding it to pending order update", order.OrderID, order.Status)
 		b.pendingOrderUpdates.Add(order)
 		b.mu.Unlock()
 		return
@@ -273,8 +298,11 @@ func (b *ActiveOrderBook) Update(order types.Order) {
 
 	// if order update time is too old, skip it
 	if previousOrder, ok := b.orders.Get(order.OrderID); ok {
-		previousUpdateTime := previousOrder.UpdateTime.Time()
-		if !previousUpdateTime.IsZero() && order.UpdateTime.Before(previousUpdateTime) {
+		// the arguments ordering is important here
+		// if we can't detect which is newer, isNewerOrderUpdate returns false
+		// if you pass two same objects to isNewerOrderUpdate, it returns false
+		if !isNewerOrderUpdate(order, previousOrder) {
+			log.Infof("[ActiveOrderBook] order #%d updateTime %s is out of date, skip it", order.OrderID, order.UpdateTime)
 			b.mu.Unlock()
 			return
 		}
@@ -287,6 +315,7 @@ func (b *ActiveOrderBook) Update(order types.Order) {
 		b.mu.Unlock()
 
 		if removed {
+			log.Infof("[ActiveOrderBook] order #%d is filled: %s", order.OrderID, order.String())
 			b.EmitFilled(order)
 		}
 		b.C.Emit()
@@ -330,13 +359,62 @@ func (b *ActiveOrderBook) Add(orders ...types.Order) {
 	}
 }
 
+func isNewerOrderUpdate(a, b types.Order) bool {
+	// compare state first
+	switch a.Status {
+
+	case types.OrderStatusCanceled, types.OrderStatusRejected: // canceled is a final state
+		switch b.Status {
+		case types.OrderStatusNew, types.OrderStatusPartiallyFilled:
+			return true
+		}
+
+	case types.OrderStatusPartiallyFilled:
+		switch b.Status {
+		case types.OrderStatusNew:
+			return true
+		case types.OrderStatusPartiallyFilled:
+			// unknown for equal
+			if a.ExecutedQuantity.Compare(b.ExecutedQuantity) > 0 {
+				return true
+			}
+
+		}
+
+	case types.OrderStatusFilled:
+		switch b.Status {
+		case types.OrderStatusFilled, types.OrderStatusPartiallyFilled, types.OrderStatusNew:
+			return true
+		}
+	}
+
+	return isNewerOrderUpdateTime(a, b)
+}
+
+func isNewerOrderUpdateTime(a, b types.Order) bool {
+	au := time.Time(a.UpdateTime)
+	bu := time.Time(b.UpdateTime)
+
+	if !au.IsZero() && !bu.IsZero() && au.After(bu) {
+		return true
+	}
+
+	if !au.IsZero() && bu.IsZero() {
+		return true
+	}
+
+	return false
+}
+
 // add the order to the active order book and check the pending order
 func (b *ActiveOrderBook) add(order types.Order) {
 	if pendingOrder, ok := b.pendingOrderUpdates.Get(order.OrderID); ok {
 		// if the pending order update time is newer than the adding order
 		// we should use the pending order rather than the adding order.
-		// if pending order is older, than we should add the new one, and drop the pending order
-		if pendingOrder.UpdateTime.Time().After(order.UpdateTime.Time()) {
+		// if the pending order is older, then we should add the new one, and drop the pending order
+		log.Debugf("found pending order update: %+v", pendingOrder)
+		if isNewerOrderUpdate(pendingOrder, order) {
+			log.Debugf("pending order update is newer: %+v", pendingOrder)
 			order = pendingOrder
 		}
 
@@ -381,4 +459,24 @@ func (b *ActiveOrderBook) Orders() types.OrderSlice {
 
 func (b *ActiveOrderBook) Lookup(f func(o types.Order) bool) *types.Order {
 	return b.orders.Lookup(f)
+}
+
+func (b *ActiveOrderBook) filterExistingOrders(orders []types.Order) (existingOrders types.OrderSlice) {
+	for _, o := range orders {
+		if b.Exists(o) {
+			existingOrders.Add(o)
+		}
+	}
+
+	return existingOrders
+}
+
+func categorizeOrderBySymbol(orders types.OrderSlice) map[string]types.OrderSlice {
+	orderMap := map[string]types.OrderSlice{}
+
+	for _, order := range orders {
+		orderMap[order.Symbol] = append(orderMap[order.Symbol], order)
+	}
+
+	return orderMap
 }

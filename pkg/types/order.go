@@ -258,11 +258,22 @@ type Order struct {
 	OrderID uint64 `json:"orderID" db:"order_id"` // order id
 	UUID    string `json:"uuid,omitempty"`
 
-	Status           OrderStatus      `json:"status" db:"status"`
+	Status OrderStatus `json:"status" db:"status"`
+
+	// OriginalStatus stores the original order status from the specific exchange
+	OriginalStatus string `json:"originalStatus,omitempty" db:"-"`
+
+	// ExecutedQuantity is how much quantity has been executed
 	ExecutedQuantity fixedpoint.Value `json:"executedQuantity" db:"executed_quantity"`
-	IsWorking        bool             `json:"isWorking" db:"is_working"`
-	CreationTime     Time             `json:"creationTime" db:"created_at"`
-	UpdateTime       Time             `json:"updateTime" db:"updated_at"`
+
+	// IsWorking means if the order is still on the order book (active order)
+	IsWorking bool `json:"isWorking" db:"is_working"`
+
+	// CreationTime is the time when this order is created
+	CreationTime Time `json:"creationTime" db:"created_at"`
+
+	// UpdateTime is the latest time when this order gets updated
+	UpdateTime Time `json:"updateTime" db:"updated_at"`
 
 	IsFutures  bool `json:"isFutures,omitempty" db:"is_futures"`
 	IsMargin   bool `json:"isMargin,omitempty" db:"is_margin"`
@@ -320,9 +331,8 @@ func (o Order) String() string {
 		orderID = strconv.FormatUint(o.OrderID, 10)
 	}
 
-	desc := fmt.Sprintf("ORDER %s | %s | %s | %s | %s %-4s | %s/%s @ %s",
+	desc := fmt.Sprintf("ORDER %s | %s | %s | %s %-4s | %s/%s @ %s",
 		o.Exchange.String(),
-		o.CreationTime.Time().Local().Format(time.StampMilli),
 		orderID,
 		o.Symbol,
 		o.Type,
@@ -335,7 +345,17 @@ func (o Order) String() string {
 		desc += " Stop @ " + o.StopPrice.String()
 	}
 
-	return desc + " | " + string(o.Status)
+	desc += " | " + string(o.Status) + " | "
+
+	desc += time.Time(o.CreationTime).UTC().Format(time.StampMilli)
+
+	if time.Time(o.UpdateTime).IsZero() {
+		desc += " -> 0"
+	} else {
+		desc += " -> " + time.Time(o.UpdateTime).UTC().Format(time.StampMilli)
+	}
+
+	return desc
 }
 
 // PlainText is used for telegram-styled messages

@@ -47,6 +47,16 @@ func (s *TradeSlice) Append(t Trade) {
 	s.mu.Unlock()
 }
 
+func (s *TradeSlice) Truncate(size int) {
+	s.mu.Lock()
+
+	if len(s.Trades) > size {
+		s.Trades = s.Trades[len(s.Trades)-1-size:]
+	}
+
+	s.mu.Unlock()
+}
+
 type Trade struct {
 	// GID is the global ID
 	GID int64 `json:"gid" db:"gid"`
@@ -110,6 +120,9 @@ func (trade Trade) CsvRecords() [][]string {
 	}
 }
 
+// PositionChange returns the position delta of this trade
+// BUY trade -> positive quantity
+// SELL trade -> negative quantity
 func (trade Trade) PositionChange() fixedpoint.Value {
 	q := trade.Quantity
 	switch trade.Side {

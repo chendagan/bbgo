@@ -3,10 +3,20 @@ package types
 import (
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // OrderMap is used for storing orders by their order id
 type OrderMap map[uint64]Order
+
+func NewOrderMap(os ...Order) OrderMap {
+	m := OrderMap{}
+	if len(os) > 0 {
+		m.Add(os...)
+	}
+	return m
+}
 
 func (m OrderMap) Backup() (orderForms []SubmitOrder) {
 	for _, order := range m {
@@ -17,8 +27,10 @@ func (m OrderMap) Backup() (orderForms []SubmitOrder) {
 }
 
 // Add the order the the map
-func (m OrderMap) Add(o Order) {
-	m[o.OrderID] = o
+func (m OrderMap) Add(os ...Order) {
+	for _, o := range os {
+		m[o.OrderID] = o
+	}
 }
 
 // Update only updates the order when the order ID exists in the map
@@ -243,3 +255,31 @@ func (m *SyncOrderMap) Orders() (slice OrderSlice) {
 }
 
 type OrderSlice []Order
+
+func (s *OrderSlice) Add(o Order) {
+	*s = append(*s, o)
+}
+
+// Map builds up an OrderMap by the order id
+func (s OrderSlice) Map() OrderMap {
+	return NewOrderMap(s...)
+}
+
+func (s OrderSlice) SeparateBySide() (buyOrders, sellOrders []Order) {
+	for _, o := range s {
+		switch o.Side {
+		case SideTypeBuy:
+			buyOrders = append(buyOrders, o)
+		case SideTypeSell:
+			sellOrders = append(sellOrders, o)
+		}
+	}
+
+	return buyOrders, sellOrders
+}
+
+func (s OrderSlice) Print() {
+	for _, o := range s {
+		logrus.Infof("%s", o)
+	}
+}

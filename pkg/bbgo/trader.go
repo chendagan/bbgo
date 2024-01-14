@@ -16,8 +16,8 @@ import (
 )
 
 // Strategy method calls:
-// -> Defaults()   (optional method)
 // -> Initialize()   (optional method)
+// -> Defaults()     (optional method)
 // -> Validate()     (optional method)
 // -> Run()          (optional method)
 // -> Shutdown(shutdownCtx context.Context, wg *sync.WaitGroup)
@@ -168,7 +168,9 @@ func (trader *Trader) SetRiskControls(riskControls *RiskControls) {
 	trader.riskControls = riskControls
 }
 
-func (trader *Trader) RunSingleExchangeStrategy(ctx context.Context, strategy SingleExchangeStrategy, session *ExchangeSession, orderExecutor OrderExecutor) error {
+func (trader *Trader) RunSingleExchangeStrategy(
+	ctx context.Context, strategy SingleExchangeStrategy, session *ExchangeSession, orderExecutor OrderExecutor,
+) error {
 	if v, ok := strategy.(StrategyValidator); ok {
 		if err := v.Validate(); err != nil {
 			return fmt.Errorf("failed to validate the config: %w", err)
@@ -242,19 +244,13 @@ func (trader *Trader) injectFieldsAndSubscribe(ctx context.Context) error {
 				}
 			}
 
-			if initializer, ok := strategy.(StrategyInitializer); ok {
-				if err := initializer.Initialize(); err != nil {
-					panic(err)
-				}
-			}
-
 			if subscriber, ok := strategy.(ExchangeSessionSubscriber); ok {
 				subscriber.Subscribe(session)
 			} else {
 				log.Errorf("strategy %s does not implement ExchangeSessionSubscriber", strategy.ID())
 			}
 
-			if symbol, ok := dynamic.LookupSymbolField(rs); ok {
+			if symbol, ok := dynamic.LookupSymbolField(rs); ok && symbol != "" {
 				log.Infof("found symbol %s based strategy from %s", symbol, rs.Type())
 
 				if err := session.initSymbol(ctx, trader.environment, symbol); err != nil {
@@ -360,17 +356,26 @@ func (trader *Trader) Run(ctx context.Context) error {
 	return trader.environment.Connect(ctx)
 }
 
+func (trader *Trader) Initialize(ctx context.Context) error {
+	log.Infof("initializing strategies...")
+	return trader.IterateStrategies(func(strategy StrategyID) error {
+		if initializer, ok := strategy.(StrategyInitializer); ok {
+			return initializer.Initialize()
+		}
+
+		return nil
+	})
+}
+
 func (trader *Trader) LoadState(ctx context.Context) error {
 	if trader.environment.BacktestService != nil {
 		return nil
 	}
 
 	isolation := GetIsolationFromContext(ctx)
-
 	ps := isolation.persistenceServiceFacade.Get()
 
 	log.Infof("loading strategies states...")
-
 	return trader.IterateStrategies(func(strategy StrategyID) error {
 		id := dynamic.CallID(strategy)
 		return loadPersistenceFields(strategy, id, ps)

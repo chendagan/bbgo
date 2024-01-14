@@ -92,8 +92,11 @@ type NotificationConfig struct {
 }
 
 type LoggingConfig struct {
-	Trade bool `json:"trade,omitempty"`
-	Order bool `json:"order,omitempty"`
+	Trade           bool                   `json:"trade,omitempty"`
+	Order           bool                   `json:"order,omitempty"`
+	Balance         bool                   `json:"balance,omitempty"`
+	FilledOrderOnly bool                   `json:"filledOrder,omitempty"`
+	Fields          map[string]interface{} `json:"fields,omitempty"`
 }
 
 type Session struct {
@@ -323,6 +326,21 @@ type ServiceConfig struct {
 	GoogleSpreadSheetService *GoogleSpreadSheetServiceConfig `json:"googleSpreadSheet" yaml:"googleSpreadSheet"`
 }
 
+type EnvironmentConfig struct {
+	DisableDefaultKLineSubscription bool `json:"disableDefaultKLineSubscription"`
+	DisableHistoryKLinePreload      bool `json:"disableHistoryKLinePreload"`
+
+	// DisableStartUpBalanceQuery disables the balance query in the startup process
+	// which initializes the session.Account with the QueryAccount method.
+	DisableStartupBalanceQuery bool `json:"disableStartupBalanceQuery"`
+
+	DisableSessionTradeBuffer bool `json:"disableSessionTradeBuffer"`
+
+	DisableMarketDataStore bool `json:"disableMarketDataStore"`
+
+	MaxSessionTradeBufferSize int `json:"maxSessionTradeBufferSize"`
+}
+
 type Config struct {
 	Build *BuildConfig `json:"build,omitempty" yaml:"build,omitempty"`
 
@@ -339,6 +357,8 @@ type Config struct {
 	Persistence *PersistenceConfig `json:"persistence,omitempty" yaml:"persistence,omitempty"`
 
 	Service *ServiceConfig `json:"services,omitempty" yaml:"services,omitempty"`
+
+	Environment *EnvironmentConfig `json:"environment,omitempty" yaml:"environment,omitempty"`
 
 	Sessions map[string]*ExchangeSession `json:"sessions,omitempty" yaml:"sessions,omitempty"`
 
