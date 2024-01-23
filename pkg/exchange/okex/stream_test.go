@@ -25,7 +25,7 @@ func getTestClientOrSkip(t *testing.T) *Stream {
 	}
 
 	exchange := New(key, secret, passphrase)
-	return NewStream(exchange.client)
+	return NewStream(exchange.client, exchange)
 }
 
 func TestStream(t *testing.T) {
@@ -37,6 +37,9 @@ func TestStream(t *testing.T) {
 		assert.NoError(t, err)
 
 		s.OnBalanceUpdate(func(balances types.BalanceMap) {
+			t.Log("got snapshot", balances)
+		})
+		s.OnBalanceSnapshot(func(balances types.BalanceMap) {
 			t.Log("got snapshot", balances)
 		})
 		s.OnBookUpdate(func(book types.SliceOrderBook) {
@@ -136,6 +139,20 @@ func TestStream(t *testing.T) {
 
 		s.Resubscribe(func(old []types.Subscription) (new []types.Subscription, err error) {
 			return old, nil
+		})
+		c := make(chan struct{})
+		<-c
+	})
+
+	t.Run("order trade test", func(t *testing.T) {
+		err := s.Connect(context.Background())
+		assert.NoError(t, err)
+
+		s.OnOrderUpdate(func(order types.Order) {
+			t.Log("order update", order)
+		})
+		s.OnTradeUpdate(func(trade types.Trade) {
+			t.Log("trade update", trade)
 		})
 		c := make(chan struct{})
 		<-c

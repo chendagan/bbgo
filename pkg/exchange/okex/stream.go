@@ -8,11 +8,16 @@ import (
 	"time"
 
 	"github.com/c9s/bbgo/pkg/exchange/okex/okexapi"
+	"github.com/c9s/bbgo/pkg/exchange/retry"
 	"github.com/c9s/bbgo/pkg/types"
 )
 
 var (
-	tradeLogLimiter = rate.NewLimiter(rate.Every(time.Minute), 1)
+	marketTradeLogLimiter = rate.NewLimiter(rate.Every(time.Minute), 1)
+	tradeLogLimiter       = rate.NewLimiter(rate.Every(time.Minute), 1)
+	// pingInterval the connection will break automatically if the subscription is not established or data has not been
+	// pushed for more than 30 seconds. Therefore, we set it to 20 seconds.
+	pingInterval = 20 * time.Second
 )
 
 type WebsocketOp struct {
@@ -31,33 +36,36 @@ type WebsocketLogin struct {
 type Stream struct {
 	types.StandardStream
 
-	client *okexapi.RestClient
+	client          *okexapi.RestClient
+	balanceProvider types.ExchangeAccountService
 
 	// public callbacks
-	kLineEventCallbacks        []func(candle KLineEvent)
-	bookEventCallbacks         []func(book BookEvent)
-	accountEventCallbacks      []func(account okexapi.Account)
-	orderDetailsEventCallbacks []func(orderDetails []okexapi.OrderDetails)
-	marketTradeEventCallbacks  []func(tradeDetail []MarketTradeEvent)
+	kLineEventCallbacks       []func(candle KLineEvent)
+	bookEventCallbacks        []func(book BookEvent)
+	accountEventCallbacks     []func(account okexapi.Account)
+	orderTradesEventCallbacks []func(orderTrades []OrderTradeEvent)
+	marketTradeEventCallbacks []func(tradeDetail []MarketTradeEvent)
 }
 
-func NewStream(client *okexapi.RestClient) *Stream {
+func NewStream(client *okexapi.RestClient, balanceProvider types.ExchangeAccountService) *Stream {
 	stream := &Stream{
-		client:         client,
-		StandardStream: types.NewStandardStream(),
+		client:          client,
+		balanceProvider: balanceProvider,
+		StandardStream:  types.NewStandardStream(),
 	}
 
 	stream.SetParser(parseWebSocketEvent)
 	stream.SetDispatcher(stream.dispatchEvent)
 	stream.SetEndpointCreator(stream.createEndpoint)
+	stream.SetPingInterval(pingInterval)
 
 	stream.OnKLineEvent(stream.handleKLineEvent)
 	stream.OnBookEvent(stream.handleBookEvent)
 	stream.OnAccountEvent(stream.handleAccountEvent)
 	stream.OnMarketTradeEvent(stream.handleMarketTradeEvent)
-	stream.OnOrderDetailsEvent(stream.handleOrderDetailsEvent)
+	stream.OnOrderTradesEvent(stream.handleOrderDetailsEvent)
 	stream.OnConnect(stream.handleConnect)
-	stream.OnAuth(stream.handleAuth)
+	stream.OnAuth(stream.subscribePrivateChannels(stream.emitBalanceSnapshot))
 	return stream
 }
 
@@ -151,40 +159,64 @@ func (s *Stream) handleConnect() {
 	}
 }
 
-func (s *Stream) handleAuth() {
-	var subs = []WebsocketSubscription{
-		{Channel: ChannelAccount},
-		{Channel: "orders", InstrumentType: string(okexapi.InstrumentTypeSpot)},
-	}
+func (s *Stream) subscribePrivateChannels(next func()) func() {
+	return func() {
+		var subs = []WebsocketSubscription{
+			{Channel: ChannelAccount},
+			{Channel: "orders", InstrumentType: string(okexapi.InstrumentTypeSpot)},
+		}
 
-	log.Infof("subscribing private channels: %+v", subs)
-	err := s.Conn.WriteJSON(WebsocketOp{
-		Op:   "subscribe",
-		Args: subs,
-	})
-	if err != nil {
-		log.WithError(err).Error("private channel subscribe error")
+		log.Infof("subscribing private channels: %+v", subs)
+		err := s.Conn.WriteJSON(WebsocketOp{
+			Op:   "subscribe",
+			Args: subs,
+		})
+		if err != nil {
+			log.WithError(err).Error("private channel subscribe error")
+			return
+		}
+		next()
 	}
 }
 
-func (s *Stream) handleOrderDetailsEvent(orderDetails []okexapi.OrderDetails) {
-	detailTrades, detailOrders := segmentOrderDetails(orderDetails)
+func (s *Stream) emitBalanceSnapshot() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
-	trades, err := toGlobalTrades(detailTrades)
+	var balancesMap types.BalanceMap
+	var err error
+	err = retry.GeneralBackoff(ctx, func() error {
+		balancesMap, err = s.balanceProvider.QueryAccountBalances(ctx)
+		return err
+	})
 	if err != nil {
-		log.WithError(err).Errorf("error converting order details into trades")
-	} else {
-		for _, trade := range trades {
-			s.EmitTradeUpdate(trade)
-		}
+		log.WithError(err).Error("no more attempts to retrieve balances")
+		return
 	}
 
-	orders, err := toGlobalOrders(detailOrders)
-	if err != nil {
-		log.WithError(err).Errorf("error converting order details into orders")
-	} else {
-		for _, order := range orders {
-			s.EmitOrderUpdate(order)
+	s.EmitBalanceSnapshot(balancesMap)
+}
+
+func (s *Stream) handleOrderDetailsEvent(orderTrades []OrderTradeEvent) {
+	for _, evt := range orderTrades {
+		if evt.TradeId != "" {
+			trade, err := evt.toGlobalTrade()
+			if err != nil {
+				if tradeLogLimiter.Allow() {
+					log.WithError(err).Errorf("failed to convert global trade")
+				}
+			} else {
+				s.EmitTradeUpdate(trade)
+			}
+		}
+
+		order, err := orderDetailToGlobal(&evt.OrderDetail)
+		if err != nil {
+			if tradeLogLimiter.Allow() {
+				log.WithError(err).Errorf("failed to convert global order")
+			}
+		} else {
+			s.EmitOrderUpdate(*order)
 		}
 	}
 }
@@ -208,7 +240,7 @@ func (s *Stream) handleMarketTradeEvent(data []MarketTradeEvent) {
 	for _, event := range data {
 		trade, err := event.toGlobalTrade()
 		if err != nil {
-			if tradeLogLimiter.Allow() {
+			if marketTradeLogLimiter.Allow() {
 				log.WithError(err).Error("failed to convert to market trade")
 			}
 			continue
@@ -262,8 +294,8 @@ func (s *Stream) dispatchEvent(e interface{}) {
 	case *okexapi.Account:
 		s.EmitAccountEvent(*et)
 
-	case []okexapi.OrderDetails:
-		s.EmitOrderDetailsEvent(et)
+	case []OrderTradeEvent:
+		s.EmitOrderTradesEvent(et)
 
 	case []MarketTradeEvent:
 		s.EmitMarketTradeEvent(et)
