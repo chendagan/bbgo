@@ -162,29 +162,44 @@ func (environ *Environment) SelectSessions(names ...string) map[string]*Exchange
 	return sessions
 }
 
-func (environ *Environment) ConfigureDatabase(ctx context.Context) error {
+func (environ *Environment) ConfigureDatabase(ctx context.Context, config *Config) error {
 	// configureDB configures the database service based on the environment variable
-	if driver, ok := os.LookupEnv("DB_DRIVER"); ok {
+	var dbDriver string
+	var dbDSN string
+	var extraPkgNames []string
 
-		if dsn, ok := os.LookupEnv("DB_DSN"); ok {
-			return environ.ConfigureDatabaseDriver(ctx, driver, dsn)
-		}
-
-	} else if dsn, ok := os.LookupEnv("SQLITE3_DSN"); ok {
-
-		return environ.ConfigureDatabaseDriver(ctx, "sqlite3", dsn)
-
-	} else if dsn, ok := os.LookupEnv("MYSQL_URL"); ok {
-
-		return environ.ConfigureDatabaseDriver(ctx, "mysql", dsn)
-
+	if config != nil && config.DatabaseConfig != nil {
+		dbDriver = config.DatabaseConfig.Driver
+		dbDSN = config.DatabaseConfig.DSN
+		extraPkgNames = config.DatabaseConfig.ExtraMigrationPackages
 	}
 
-	return nil
+	if val, ok := os.LookupEnv("DB_DRIVER"); ok {
+		dbDriver = val
+	}
+
+	if val, ok := os.LookupEnv("DB_DSN"); ok {
+		dbDSN = val
+	} else if val, ok := os.LookupEnv("SQLITE3_DSN"); ok && (dbDriver == "" || dbDriver == "sqlite3") {
+		dbDSN = val
+		dbDriver = "sqlite3"
+	} else if val, ok := os.LookupEnv("MYSQL_URL"); ok && (dbDriver == "" || dbDriver == "mysql") {
+		dbDSN = val
+		dbDriver = "mysql"
+	}
+
+	// database is optional
+	if dbDriver == "" || dbDSN == "" {
+		return nil
+	}
+
+	return environ.ConfigureDatabaseDriver(ctx, dbDriver, dbDSN, extraPkgNames...)
 }
 
-func (environ *Environment) ConfigureDatabaseDriver(ctx context.Context, driver string, dsn string) error {
+func (environ *Environment) ConfigureDatabaseDriver(ctx context.Context, driver string, dsn string, extraPkgNames ...string) error {
 	environ.DatabaseService = service.NewDatabaseService(driver, dsn)
+	environ.DatabaseService.AddMigrationPackages(extraPkgNames...)
+
 	err := environ.DatabaseService.Connect()
 	if err != nil {
 		return err

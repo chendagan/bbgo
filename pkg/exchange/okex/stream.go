@@ -3,9 +3,11 @@ package okex
 import (
 	"context"
 	"fmt"
-	"golang.org/x/time/rate"
 	"strconv"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 
 	"github.com/c9s/bbgo/pkg/exchange/okex/okexapi"
 	"github.com/c9s/bbgo/pkg/exchange/retry"
@@ -35,6 +37,7 @@ type WebsocketLogin struct {
 //go:generate callbackgen -type Stream -interface
 type Stream struct {
 	types.StandardStream
+	kLineStream *KLineStream
 
 	client          *okexapi.RestClient
 	balanceProvider types.ExchangeAccountService
@@ -52,6 +55,7 @@ func NewStream(client *okexapi.RestClient, balanceProvider types.ExchangeAccount
 		client:          client,
 		balanceProvider: balanceProvider,
 		StandardStream:  types.NewStandardStream(),
+		kLineStream:     NewKLineStream(),
 	}
 
 	stream.SetParser(parseWebSocketEvent)
@@ -59,24 +63,26 @@ func NewStream(client *okexapi.RestClient, balanceProvider types.ExchangeAccount
 	stream.SetEndpointCreator(stream.createEndpoint)
 	stream.SetPingInterval(pingInterval)
 
-	stream.OnKLineEvent(stream.handleKLineEvent)
 	stream.OnBookEvent(stream.handleBookEvent)
 	stream.OnAccountEvent(stream.handleAccountEvent)
 	stream.OnMarketTradeEvent(stream.handleMarketTradeEvent)
 	stream.OnOrderTradesEvent(stream.handleOrderDetailsEvent)
 	stream.OnConnect(stream.handleConnect)
 	stream.OnAuth(stream.subscribePrivateChannels(stream.emitBalanceSnapshot))
+	stream.kLineStream.OnKLineClosed(stream.EmitKLineClosed)
+	stream.kLineStream.OnKLine(stream.EmitKLine)
+
 	return stream
 }
 
-func (s *Stream) syncSubscriptions(opType WsEventType) error {
+func syncSubscriptions(conn *websocket.Conn, subscriptions []types.Subscription, opType WsEventType) error {
 	if opType != WsEventTypeUnsubscribe && opType != WsEventTypeSubscribe {
 		return fmt.Errorf("unexpected subscription type: %v", opType)
 	}
 
 	logger := log.WithField("opType", opType)
 	var topics []WebsocketSubscription
-	for _, subscription := range s.Subscriptions {
+	for _, subscription := range subscriptions {
 		topic, err := convertSubscription(subscription)
 		if err != nil {
 			logger.WithError(err).Errorf("convert error, subscription: %+v", subscription)
@@ -87,7 +93,7 @@ func (s *Stream) syncSubscriptions(opType WsEventType) error {
 	}
 
 	logger.Infof("%s channels: %+v", opType, topics)
-	if err := s.Conn.WriteJSON(WebsocketOp{
+	if err := conn.WriteJSON(WebsocketOp{
 		Op:   opType,
 		Args: topics,
 	}); err != nil {
@@ -100,11 +106,47 @@ func (s *Stream) syncSubscriptions(opType WsEventType) error {
 
 func (s *Stream) Unsubscribe() {
 	// errors are handled in the syncSubscriptions, so they are skipped here.
-	_ = s.syncSubscriptions(WsEventTypeUnsubscribe)
+	_ = syncSubscriptions(s.StandardStream.Conn, s.StandardStream.Subscriptions, WsEventTypeUnsubscribe)
 	s.Resubscribe(func(old []types.Subscription) (new []types.Subscription, err error) {
 		// clear the subscriptions
 		return []types.Subscription{}, nil
 	})
+
+	s.kLineStream.Unsubscribe()
+}
+
+func (s *Stream) Connect(ctx context.Context) error {
+	if err := s.StandardStream.Connect(ctx); err != nil {
+		return err
+	}
+	if err := s.kLineStream.Connect(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Stream) Subscribe(channel types.Channel, symbol string, options types.SubscribeOptions) {
+	if channel == types.KLineChannel {
+		s.kLineStream.Subscribe(channel, symbol, options)
+	} else {
+		s.StandardStream.Subscribe(channel, symbol, options)
+	}
+}
+
+func subscribe(conn *websocket.Conn, subs []WebsocketSubscription) {
+	if len(subs) == 0 {
+		return
+	}
+
+	log.Infof("subscribing channels: %+v", subs)
+	err := conn.WriteJSON(WebsocketOp{
+		Op:   "subscribe",
+		Args: subs,
+	})
+
+	if err != nil {
+		log.WithError(err).Error("subscribe error")
+	}
 }
 
 func (s *Stream) handleConnect() {
@@ -119,19 +161,7 @@ func (s *Stream) handleConnect() {
 
 			subs = append(subs, sub)
 		}
-		if len(subs) == 0 {
-			return
-		}
-
-		log.Infof("subscribing channels: %+v", subs)
-		err := s.Conn.WriteJSON(WebsocketOp{
-			Op:   "subscribe",
-			Args: subs,
-		})
-
-		if err != nil {
-			log.WithError(err).Error("subscribe error")
-		}
+		subscribe(s.StandardStream.Conn, subs)
 	} else {
 		// login as private channel
 		// sign example:
@@ -250,17 +280,6 @@ func (s *Stream) handleMarketTradeEvent(data []MarketTradeEvent) {
 	}
 }
 
-func (s *Stream) handleKLineEvent(k KLineEvent) {
-	for _, event := range k.Events {
-		kline := event.ToGlobal(types.Interval(k.Interval), k.Symbol)
-		if kline.Closed {
-			s.EmitKLineClosed(kline)
-		} else {
-			s.EmitKLine(kline)
-		}
-	}
-}
-
 func (s *Stream) createEndpoint(ctx context.Context) (string, error) {
 	var url string
 	if s.PublicOnly {
@@ -288,8 +307,6 @@ func (s *Stream) dispatchEvent(e interface{}) {
 			s.EmitBookEvent(*et)
 		}
 		s.EmitBookTickerUpdate(et.BookTicker())
-	case *KLineEvent:
-		s.EmitKLineEvent(*et)
 
 	case *okexapi.Account:
 		s.EmitAccountEvent(*et)
