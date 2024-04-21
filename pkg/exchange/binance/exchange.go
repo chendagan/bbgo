@@ -3,7 +3,6 @@ package binance
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,12 +66,7 @@ func init() {
 }
 
 func isBinanceUs() bool {
-	v, err := strconv.ParseBool(os.Getenv("BINANCE_US"))
-	return err == nil && v
-}
-
-func paperTrade() bool {
-	v, ok := util.GetEnvVarBool("PAPER_TRADE")
+	v, ok := util.GetEnvVarBool("BINANCE_US")
 	return ok && v
 }
 
@@ -97,6 +91,9 @@ type Exchange struct {
 var timeSetterOnce sync.Once
 
 func New(key, secret string) *Exchange {
+	if util.IsPaperTrade() {
+		binance.UseTestnet = true
+	}
 	var client = binance.NewClient(key, secret)
 	client.HTTPClient = binanceapi.DefaultHttpClient
 	client.Debug = viper.GetBool("debug-binance-client")
@@ -107,11 +104,6 @@ func New(key, secret string) *Exchange {
 
 	if isBinanceUs() {
 		client.BaseURL = BinanceUSBaseURL
-	}
-
-	if paperTrade() {
-		client.BaseURL = BinanceTestBaseURL
-		futuresClient.BaseURL = FutureTestBaseURL
 	}
 
 	client2 := binanceapi.NewClient(client.BaseURL)
@@ -129,24 +121,24 @@ func New(key, secret string) *Exchange {
 	if len(key) > 0 && len(secret) > 0 {
 		client2.Auth(key, secret)
 		futuresClient2.Auth(key, secret)
-
-		ctx := context.Background()
-		go timeSetterOnce.Do(func() {
-			ex.setServerTimeOffset(ctx)
-
-			ticker := time.NewTicker(time.Hour)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-
-				case <-ticker.C:
-					ex.setServerTimeOffset(ctx)
-				}
-			}
-		})
 	}
+
+	ctx := context.Background()
+	go timeSetterOnce.Do(func() {
+		ex.setServerTimeOffset(ctx)
+
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			case <-ticker.C:
+				ex.setServerTimeOffset(ctx)
+			}
+		}
+	})
 
 	return ex
 }
@@ -328,43 +320,39 @@ func (e *Exchange) QueryMarginAssetMaxBorrowable(ctx context.Context, asset stri
 	return resp.Amount, nil
 }
 
-func (e *Exchange) RepayMarginAsset(ctx context.Context, asset string, amount fixedpoint.Value) error {
-	req := e.client.NewMarginRepayService()
+func (e *Exchange) borrowRepayAsset(
+	ctx context.Context, asset string, amount fixedpoint.Value, marginType binanceapi.BorrowRepayType,
+) error {
+	req := e.client2.NewPlaceMarginOrderRequest()
 	req.Asset(asset)
-	req.Amount(amount.String())
+	req.Amount(amount)
+	req.SetBorrowRepayType(marginType)
 	if e.IsIsolatedMargin {
+		req.IsIsolated(e.IsIsolatedMargin)
 		req.Symbol(e.IsolatedMarginSymbol)
 	}
 
-	log.Infof("repaying margin asset %s amount %f", asset, amount.Float64())
+	log.Infof("%s margin asset %s amount %f", marginType, asset, amount.Float64())
 	resp, err := req.Do(ctx)
 	if err != nil {
 		return err
 	}
 
-	log.Debugf("margin repayed %f %s, transaction id = %d", amount.Float64(), asset, resp.TranID)
+	log.Debugf("margin %s %f %s, transaction id = %d", marginType, amount.Float64(), asset, resp.TranId)
 	return err
+}
+
+func (e *Exchange) RepayMarginAsset(ctx context.Context, asset string, amount fixedpoint.Value) error {
+	return e.borrowRepayAsset(ctx, asset, amount, binanceapi.BorrowRepayTypeRepay)
 }
 
 func (e *Exchange) BorrowMarginAsset(ctx context.Context, asset string, amount fixedpoint.Value) error {
-	req := e.client.NewMarginLoanService()
-	req.Asset(asset)
-	req.Amount(amount.String())
-	if e.IsIsolatedMargin {
-		req.Symbol(e.IsolatedMarginSymbol)
-	}
-
-	log.Infof("borrowing margin asset %s amount %f", asset, amount.Float64())
-	resp, err := req.Do(ctx)
-	if err != nil {
-		return err
-	}
-	log.Debugf("margin borrowed %f %s, transaction id = %d", amount.Float64(), asset, resp.TranID)
-	return err
+	return e.borrowRepayAsset(ctx, asset, amount, binanceapi.BorrowRepayTypeBorrow)
 }
 
 func (e *Exchange) QueryMarginBorrowHistory(ctx context.Context, asset string) error {
-	req := e.client.NewListMarginLoansService()
+	req := e.client2.NewGetMarginBorrowRepayHistoryRequest()
+	req.SetBorrowRepayType(binanceapi.BorrowRepayTypeBorrow)
 	req.Asset(asset)
 	history, err := req.Do(ctx)
 	if err != nil {
@@ -393,17 +381,17 @@ func (e *Exchange) TransferMarginAccountAsset(
 func (e *Exchange) transferIsolatedMarginAccountAsset(
 	ctx context.Context, asset string, amount fixedpoint.Value, io types.TransferDirection,
 ) error {
-	req := e.client2.NewTransferIsolatedMarginAccountRequest()
-	req.Symbol(e.IsolatedMarginSymbol)
+	req := e.client2.NewTransferAssetRequest()
+	req.Asset(asset)
+	req.FromSymbol(e.IsolatedMarginSymbol)
+	req.ToSymbol(e.IsolatedMarginSymbol)
 
 	switch io {
 	case types.TransferIn:
-		req.TransFrom(binanceapi.AccountTypeSpot)
-		req.TransTo(binanceapi.AccountTypeIsolatedMargin)
+		req.TransferType(binanceapi.TransferAssetTypeMainToIsolatedMargin)
 
 	case types.TransferOut:
-		req.TransFrom(binanceapi.AccountTypeIsolatedMargin)
-		req.TransTo(binanceapi.AccountTypeSpot)
+		req.TransferType(binanceapi.TransferAssetTypeIsolatedMarginToMain)
 	}
 
 	req.Asset(asset)
@@ -416,14 +404,14 @@ func (e *Exchange) transferIsolatedMarginAccountAsset(
 func (e *Exchange) transferCrossMarginAccountAsset(
 	ctx context.Context, asset string, amount fixedpoint.Value, io types.TransferDirection,
 ) error {
-	req := e.client2.NewTransferCrossMarginAccountRequest()
+	req := e.client2.NewTransferAssetRequest()
 	req.Asset(asset)
 	req.Amount(amount.String())
 
 	if io == types.TransferIn {
-		req.TransferType(int(binance.MarginTransferTypeToMargin))
+		req.TransferType(binanceapi.TransferAssetTypeMainToMargin)
 	} else if io == types.TransferOut {
-		req.TransferType(int(binance.MarginTransferTypeToMain))
+		req.TransferType(binanceapi.TransferAssetTypeMarginToMain)
 	} else {
 		return fmt.Errorf("unexpected transfer direction: %d given", io)
 	}
@@ -1352,15 +1340,32 @@ func (e *Exchange) QueryDepth(ctx context.Context, symbol string) (snapshot type
 		return e.queryFuturesDepth(ctx, symbol)
 	}
 
-	response, err := e.client.NewDepthService().Symbol(symbol).Limit(DefaultDepthLimit).Do(ctx)
+	response, err := e.client2.NewGetDepthRequest().Symbol(symbol).Limit(DefaultDepthLimit).Do(ctx)
 	if err != nil {
 		return snapshot, finalUpdateID, err
 	}
 
-	return convertDepth(snapshot, symbol, finalUpdateID, response)
+	return convertDepth(symbol, response)
 }
 
-func convertDepth(
+func convertDepth(symbol string, response *binanceapi.Depth) (snapshot types.SliceOrderBook, finalUpdateID int64, err error) {
+	snapshot.Symbol = symbol
+	snapshot.Time = time.Now()
+	snapshot.LastUpdateId = response.LastUpdateId
+
+	finalUpdateID = response.LastUpdateId
+	for _, entry := range response.Bids {
+		snapshot.Bids = append(snapshot.Bids, types.PriceVolume{Price: entry[0], Volume: entry[1]})
+	}
+
+	for _, entry := range response.Asks {
+		snapshot.Asks = append(snapshot.Asks, types.PriceVolume{Price: entry[0], Volume: entry[1]})
+	}
+
+	return snapshot, finalUpdateID, err
+}
+
+func convertDepthLegacy(
 	snapshot types.SliceOrderBook, symbol string, finalUpdateID int64, response *binance.DepthResponse,
 ) (types.SliceOrderBook, int64, error) {
 	snapshot.Symbol = symbol
@@ -1432,7 +1437,7 @@ func (e *Exchange) QueryFundingRateHistory(ctx context.Context, symbol string) (
 	return &types.FundingRate{
 		FundingRate: fundingRate,
 		FundingTime: time.Unix(0, rate.FundingTime*int64(time.Millisecond)),
-		Time:        time.Unix(0, rate.Time*int64(time.Millisecond)),
+		Time:        time.Unix(0, rate.FundingTime*int64(time.Millisecond)),
 	}, nil
 }
 

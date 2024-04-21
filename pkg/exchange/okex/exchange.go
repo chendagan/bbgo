@@ -3,6 +3,7 @@ package okex
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -16,23 +17,33 @@ import (
 	"github.com/c9s/bbgo/pkg/types"
 )
 
-// Okex rate limit list in each api document
-// The default order limiter apply 30 requests per second and a 5 initial bucket
-// this includes QueryOrder, QueryOrderTrades, SubmitOrder, QueryOpenOrders, CancelOrders
-// Market data limiter means public api, this includes QueryMarkets, QueryTicker, QueryTickers, QueryKLines
 var (
-	marketDataLimiter = rate.NewLimiter(rate.Every(100*time.Millisecond), 5)
+	// clientOrderIdRegex combine of case-sensitive alphanumerics, all numbers, or all letters of up to 32 characters.
+	clientOrderIdRegex = regexp.MustCompile("^[a-zA-Z0-9]{0,32}$")
 
-	queryMarketLimiter          = rate.NewLimiter(rate.Every(100*time.Millisecond), 10)
-	queryTickerLimiter          = rate.NewLimiter(rate.Every(100*time.Millisecond), 10)
-	queryTickersLimiter         = rate.NewLimiter(rate.Every(100*time.Millisecond), 10)
-	queryAccountLimiter         = rate.NewLimiter(rate.Every(200*time.Millisecond), 5)
-	placeOrderLimiter           = rate.NewLimiter(rate.Every(30*time.Millisecond), 30)
-	batchCancelOrderLimiter     = rate.NewLimiter(rate.Every(5*time.Millisecond), 200)
-	queryOpenOrderLimiter       = rate.NewLimiter(rate.Every(30*time.Millisecond), 30)
-	queryClosedOrderRateLimiter = rate.NewLimiter(rate.Every(100*time.Millisecond), 10)
-	queryTradeLimiter           = rate.NewLimiter(rate.Every(100*time.Millisecond), 10)
-	queryKLineLimiter           = rate.NewLimiter(rate.Every(100*time.Millisecond), 20)
+	// Rate Limit: 20 requests per 2 seconds, Rate limit rule: IP + instrumentType.
+	// Currently, calls are not made very frequently, so only IP is considered.
+	queryMarketLimiter = rate.NewLimiter(rate.Every(100*time.Millisecond), 1)
+	// Rate Limit: 20 requests per 2 seconds, Rate limit rule: IP
+	queryTickerLimiter = rate.NewLimiter(rate.Every(100*time.Millisecond), 1)
+	// Rate Limit: 20 requests per 2 seconds, Rate limit rule: IP
+	queryTickersLimiter = rate.NewLimiter(rate.Every(100*time.Millisecond), 1)
+	// Rate Limit: 10 requests per 2 seconds, Rate limit rule: UserID
+	queryAccountLimiter = rate.NewLimiter(rate.Every(200*time.Millisecond), 1)
+	// Rate Limit: 60 requests per 2 seconds, Rate limit rule (except Options): UserID + Instrument ID.
+	// TODO: support UserID + Instrument ID
+	placeOrderLimiter = rate.NewLimiter(rate.Every(33*time.Millisecond), 1)
+	// Rate Limit: 60 requests per 2 seconds, Rate limit rule (except Options): UserID + Instrument ID
+	// TODO: support UserID + Instrument ID
+	batchCancelOrderLimiter = rate.NewLimiter(rate.Every(33*time.Millisecond), 1)
+	// Rate Limit: 60 requests per 2 seconds, Rate limit rule: UserID
+	queryOpenOrderLimiter = rate.NewLimiter(rate.Every(33*time.Millisecond), 1)
+	// Rate Limit: 20 requests per 2 seconds, Rate limit rule: UserID
+	queryClosedOrderRateLimiter = rate.NewLimiter(rate.Every(100*time.Millisecond), 1)
+	// Rate Limit: 10 requests per 2 seconds, Rate limit rule: UserID
+	queryTradeLimiter = rate.NewLimiter(rate.Every(200*time.Millisecond), 1)
+	// Rate Limit: 40 requests per 2 seconds, Rate limit rule: IP
+	queryKLineLimiter = rate.NewLimiter(rate.Every(50*time.Millisecond), 1)
 )
 
 const (
@@ -44,6 +55,7 @@ const (
 	defaultQueryLimit = 100
 
 	maxHistoricalDataQueryPeriod = 90 * 24 * time.Hour
+	threeDaysHistoricalPeriod    = 3 * 24 * time.Hour
 )
 
 var log = logrus.WithFields(logrus.Fields{
@@ -55,7 +67,8 @@ var ErrSymbolRequired = errors.New("symbol is a required parameter")
 type Exchange struct {
 	key, secret, passphrase string
 
-	client *okexapi.RestClient
+	client      *okexapi.RestClient
+	timeNowFunc func() time.Time
 }
 
 func New(key, secret, passphrase string) *Exchange {
@@ -66,10 +79,11 @@ func New(key, secret, passphrase string) *Exchange {
 	}
 
 	return &Exchange{
-		key:        key,
-		secret:     secret,
-		passphrase: passphrase,
-		client:     client,
+		key:         key,
+		secret:      secret,
+		passphrase:  passphrase,
+		client:      client,
+		timeNowFunc: time.Now,
 	}
 }
 
@@ -91,6 +105,7 @@ func (e *Exchange) QueryMarkets(ctx context.Context) (types.MarketMap, error) {
 	for _, instrument := range instruments {
 		symbol := toGlobalSymbol(instrument.InstrumentID)
 		market := types.Market{
+			Exchange:    types.ExchangeOKEx,
 			Symbol:      symbol,
 			LocalSymbol: instrument.InstrumentID,
 
@@ -210,7 +225,7 @@ func (e *Exchange) SubmitOrder(ctx context.Context, order types.SubmitOrder) (*t
 
 	// set price field for limit orders
 	switch order.Type {
-	case types.OrderTypeStopLimit, types.OrderTypeLimit:
+	case types.OrderTypeStopLimit, types.OrderTypeLimit, types.OrderTypeLimitMaker:
 		orderReq.Price(order.Market.FormatPrice(order.Price))
 	case types.OrderTypeMarket:
 		// Because our order.Quantity unit is base coin, so we indicate the target currency to Base.
@@ -241,12 +256,14 @@ func (e *Exchange) SubmitOrder(ctx context.Context, order types.SubmitOrder) (*t
 		return nil, fmt.Errorf("place order rate limiter wait error: %w", err)
 	}
 
-	_, err = strconv.ParseInt(order.ClientOrderID, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("client order id should be numberic: %s, err: %w", order.ClientOrderID, err)
+	if len(order.ClientOrderID) > 0 {
+		if ok := clientOrderIdRegex.MatchString(order.ClientOrderID); !ok {
+			return nil, fmt.Errorf("client order id should be case-sensitive alphanumerics, all numbers, or all letters of up to 32 characters: %s", order.ClientOrderID)
+		}
+		orderReq.ClientOrderID(order.ClientOrderID)
 	}
-	orderReq.ClientOrderID(order.ClientOrderID)
 
+	timeNow := time.Now()
 	orders, err := orderReq.Do(ctx)
 	if err != nil {
 		return nil, err
@@ -256,16 +273,21 @@ func (e *Exchange) SubmitOrder(ctx context.Context, order types.SubmitOrder) (*t
 		return nil, fmt.Errorf("unexpected length of order response: %v", orders)
 	}
 
-	orderRes, err := e.QueryOrder(ctx, types.OrderQuery{
-		Symbol:        order.Symbol,
-		OrderID:       orders[0].OrderID,
-		ClientOrderID: orders[0].ClientOrderID,
-	})
+	orderID, err := strconv.ParseUint(orders[0].OrderID, 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query order by id: %s, clientOrderId: %s, err: %w", orders[0].OrderID, orders[0].ClientOrderID, err)
+		return nil, fmt.Errorf("failed to parse response order id: %w", err)
 	}
 
-	return orderRes, nil
+	return &types.Order{
+		SubmitOrder:      order,
+		Exchange:         types.ExchangeOKEx,
+		OrderID:          orderID,
+		Status:           types.OrderStatusNew,
+		ExecutedQuantity: fixedpoint.Zero,
+		IsWorking:        true,
+		CreationTime:     types.Time(timeNow),
+		UpdateTime:       types.Time(timeNow),
+	}, nil
 
 	// TODO: move this to batch place orders interface
 	/*
@@ -357,9 +379,8 @@ func (e *Exchange) CancelOrders(ctx context.Context, orders ...types.Order) erro
 		req.InstrumentID(toLocalSymbol(order.Symbol))
 		req.OrderID(strconv.FormatUint(order.OrderID, 10))
 		if len(order.ClientOrderID) > 0 {
-			_, err := strconv.ParseInt(order.ClientOrderID, 10, 64)
-			if err != nil {
-				return fmt.Errorf("client order id should be numberic: %s, err: %w", order.ClientOrderID, err)
+			if ok := clientOrderIdRegex.MatchString(order.ClientOrderID); !ok {
+				return fmt.Errorf("client order id should be case-sensitive alphanumerics, all numbers, or all letters of up to 32 characters: %s", order.ClientOrderID)
 			}
 			req.ClientOrderID(order.ClientOrderID)
 		}
@@ -379,7 +400,9 @@ func (e *Exchange) NewStream() types.Stream {
 	return NewStream(e.client, e)
 }
 
-func (e *Exchange) QueryKLines(ctx context.Context, symbol string, interval types.Interval, options types.KLineQueryOptions) ([]types.KLine, error) {
+func (e *Exchange) QueryKLines(
+	ctx context.Context, symbol string, interval types.Interval, options types.KLineQueryOptions,
+) ([]types.KLine, error) {
 	if err := queryKLineLimiter.Wait(ctx); err != nil {
 		return nil, fmt.Errorf("query k line rate limiter wait error: %w", err)
 	}
@@ -473,7 +496,9 @@ If you want to query all orders within a large time range (e.g. total orders > 1
 
 ** since and until are inclusive, you can include the lastTradeId as well. **
 */
-func (e *Exchange) QueryClosedOrders(ctx context.Context, symbol string, since, until time.Time, lastOrderID uint64) (orders []types.Order, err error) {
+func (e *Exchange) QueryClosedOrders(
+	ctx context.Context, symbol string, since, until time.Time, lastOrderID uint64,
+) (orders []types.Order, err error) {
 	if symbol == "" {
 		return nil, ErrSymbolRequired
 	}
@@ -535,31 +560,30 @@ REMARK: If your start time is 90 days earlier, we will update it to now - 90 day
 ** StartTime, EndTime, FromTradeId can be used together. **
 
 If you want to query all trades within a large time range (e.g. total orders > 100), we recommend using batch.TradeBatchQuery.
+We don't support the last trade id as a filter because okx supports bill ID only.
 */
 func (e *Exchange) QueryTrades(ctx context.Context, symbol string, options *types.TradeQueryOptions) (trades []types.Trade, err error) {
 	if symbol == "" {
 		return nil, ErrSymbolRequired
 	}
 
-	req := e.client.NewGetTransactionHistoryRequest().InstrumentID(toLocalSymbol(symbol))
-
 	limit := options.Limit
-	req.Limit(uint64(limit))
 	if limit > defaultQueryLimit || limit <= 0 {
 		log.Infof("limit is exceeded default limit %d or zero, got: %d, use default limit", defaultQueryLimit, limit)
-		req.Limit(defaultQueryLimit)
+		limit = defaultQueryLimit
 	}
 
-	var newStartTime time.Time
+	timeNow := e.timeNowFunc()
+	newStartTime := timeNow.Add(-threeDaysHistoricalPeriod)
 	if options.StartTime != nil {
 		newStartTime = *options.StartTime
-		if time.Since(newStartTime) > maxHistoricalDataQueryPeriod {
-			newStartTime = time.Now().Add(-maxHistoricalDataQueryPeriod)
+		if timeNow.Sub(newStartTime) > maxHistoricalDataQueryPeriod {
+			newStartTime = timeNow.Add(-maxHistoricalDataQueryPeriod)
 			log.Warnf("!!!OKX EXCHANGE API NOTICE!!! The trade API cannot query data beyond 90 days from the current date, update %s -> %s", *options.StartTime, newStartTime)
 		}
-		req.StartTime(newStartTime.UTC())
 	}
 
+	endTime := timeNow
 	if options.EndTime != nil {
 		if options.EndTime.Before(newStartTime) {
 			return nil, fmt.Errorf("end time %s before start %s", *options.EndTime, newStartTime)
@@ -567,23 +591,62 @@ func (e *Exchange) QueryTrades(ctx context.Context, symbol string, options *type
 		if options.EndTime.Sub(newStartTime) > maxHistoricalDataQueryPeriod {
 			return nil, fmt.Errorf("start time %s and end time %s cannot greater than 90 days", newStartTime, options.EndTime)
 		}
-		req.EndTime(options.EndTime.UTC())
-	}
-	req.Before(strconv.FormatUint(options.LastTradeID, 10))
-
-	if err := queryTradeLimiter.Wait(ctx); err != nil {
-		return nil, fmt.Errorf("query trades rate limiter wait error: %w", err)
+		endTime = *options.EndTime
 	}
 
-	response, err := req.Do(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query trades, err: %w", err)
+	if options.LastTradeID != 0 {
+		// we don't support the last trade id as a filter because okx supports bill ID only.
+		// we don't have any more fields (types.Trade) to store it.
+		log.Infof("Last trade id not supported on QueryTrades")
 	}
 
-	for _, trade := range response {
-		trades = append(trades, tradeToGlobal(trade))
+	if timeNow.Sub(newStartTime) <= threeDaysHistoricalPeriod {
+		c := e.client.NewGetThreeDaysTransactionHistoryRequest().
+			InstrumentID(toLocalSymbol(symbol)).
+			StartTime(newStartTime).
+			EndTime(endTime).
+			Limit(uint64(limit))
+		return getTrades(ctx, limit, func(ctx context.Context, billId string) ([]okexapi.Trade, error) {
+			c.Before(billId)
+			return c.Do(ctx)
+		})
 	}
 
+	c := e.client.NewGetTransactionHistoryRequest().
+		InstrumentID(toLocalSymbol(symbol)).
+		StartTime(newStartTime).
+		EndTime(endTime).
+		Limit(uint64(limit))
+	return getTrades(ctx, limit, func(ctx context.Context, billId string) ([]okexapi.Trade, error) {
+		c.Before(billId)
+		return c.Do(ctx)
+	})
+}
+
+func getTrades(ctx context.Context, limit int64, doFunc func(ctx context.Context, billId string) ([]okexapi.Trade, error)) (trades []types.Trade, err error) {
+	billId := "0"
+	for {
+		response, err := doFunc(ctx, billId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query trades, err: %w", err)
+		}
+
+		for _, trade := range response {
+			trades = append(trades, tradeToGlobal(trade))
+		}
+
+		tradeLen := int64(len(response))
+		// a defensive programming to ensure the length of order response is expected.
+		if tradeLen > limit {
+			return nil, fmt.Errorf("unexpected trade length %d", tradeLen)
+		}
+
+		if tradeLen < limit {
+			break
+		}
+		// use Before filter to get all data.
+		billId = response[tradeLen-1].BillId.String()
+	}
 	return trades, nil
 }
 

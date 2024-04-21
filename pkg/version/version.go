@@ -3,6 +3,6 @@
 
 package version
 
-const Version = "v1.56.2-35b7667d"
+const Version = "v1.58.0-d58461d1"
 
-const VersionGitRef = "35b7667d"
+const VersionGitRef = "d58461d1"

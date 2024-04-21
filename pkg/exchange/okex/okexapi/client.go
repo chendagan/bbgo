@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -18,9 +19,9 @@ import (
 )
 
 const defaultHTTPTimeout = time.Second * 15
-const RestBaseURL = "https://www.okex.com/"
-const PublicWebSocketURL = "wss://ws.okex.com:8443/ws/v5/public"
-const PrivateWebSocketURL = "wss://ws.okex.com:8443/ws/v5/private"
+const RestBaseURL = "https://aws.okx.com/"
+const PublicWebSocketURL = "wss://wsaws.okx.com:8443/ws/v5/public"
+const PrivateWebSocketURL = "wss://wsaws.okx.com:8443/ws/v5/private"
 const PublicBusinessWebSocketURL = "wss://wsaws.okx.com:8443/ws/v5/business"
 
 type SideType string
@@ -245,4 +246,15 @@ type APIResponse struct {
 	Code    string          `json:"code"`
 	Message string          `json:"msg"`
 	Data    json.RawMessage `json:"data"`
+}
+
+func (a APIResponse) Validate() error {
+	if a.Code != "0" {
+		return a.Error()
+	}
+	return nil
+}
+
+func (a APIResponse) Error() error {
+	return fmt.Errorf("retCode: %s, retMsg: %s, data: %s", a.Code, a.Message, string(a.Data))
 }

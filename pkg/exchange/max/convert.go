@@ -172,7 +172,6 @@ func toGlobalOrder(maxOrder max.Order) (*types.Order, error) {
 	executedVolume := maxOrder.ExecutedVolume
 	remainingVolume := maxOrder.RemainingVolume
 	isMargin := maxOrder.WalletType == max.WalletTypeMargin
-
 	return &types.Order{
 		SubmitOrder: types.SubmitOrder{
 			ClientOrderID: maxOrder.ClientOID,
@@ -202,6 +201,11 @@ func toGlobalTradeV3(t v3.Trade) ([]types.Trade, error) {
 	isMargin := t.WalletType == max.WalletTypeMargin
 	side := toGlobalSideType(t.Side)
 
+	fee := fixedpoint.Zero
+	if t.Fee != nil {
+		fee = *t.Fee
+	}
+
 	trade := types.Trade{
 		ID:            t.ID,
 		OrderID:       t.OrderID,
@@ -212,7 +216,8 @@ func toGlobalTradeV3(t v3.Trade) ([]types.Trade, error) {
 		Side:          side,
 		IsBuyer:       t.IsBuyer(),
 		IsMaker:       t.IsMaker(),
-		Fee:           t.Fee,
+		Fee:           fee,
+		FeeProcessing: t.Fee == nil,
 		FeeCurrency:   toGlobalCurrency(t.FeeCurrency),
 		FeeDiscounted: t.FeeDiscounted,
 		QuoteQuantity: t.Funds,
@@ -283,6 +288,7 @@ func toGlobalDepositStatus(a max.DepositState) types.DepositStatus {
 
 	// other states goes to this
 	// max.DepositStateSuspect, max.DepositStateSuspended
+	log.Warnf("unsupported deposit state %q from max exchange", a)
 	return types.DepositStatus(a)
 }
 

@@ -4,9 +4,14 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"strconv"
 	"sync"
 	"time"
+
+	"github.com/cenkalti/backoff/v4"
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
+	"go.uber.org/multierr"
 
 	"github.com/c9s/bbgo/pkg/bbgo"
 	"github.com/c9s/bbgo/pkg/exchange/retry"
@@ -14,16 +19,18 @@ import (
 	"github.com/c9s/bbgo/pkg/strategy/common"
 	"github.com/c9s/bbgo/pkg/types"
 	"github.com/c9s/bbgo/pkg/util"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
-	"go.uber.org/multierr"
+	"github.com/c9s/bbgo/pkg/util/tradingutil"
 )
 
-const ID = "dca2"
+const (
+	ID       = "dca2"
+	orderTag = "dca2"
+)
 
-const orderTag = "dca2"
-
-var log = logrus.WithField("strategy", ID)
+var (
+	log        = logrus.WithField("strategy", ID)
+	baseLabels prometheus.Labels
+)
 
 func init() {
 	bbgo.RegisterStrategy(ID, &Strategy{})
@@ -37,13 +44,14 @@ type advancedOrderCancelApi interface {
 
 //go:generate callbackgen -type Strateg
 type Strategy struct {
-	Position    *types.Position `json:"position,omitempty" persistence:"position"`
-	ProfitStats *ProfitStats    `json:"profitStats,omitempty" persistence:"profit_stats"`
+	Position       *types.Position `json:"position,omitempty" persistence:"position"`
+	ProfitStats    *ProfitStats    `json:"profitStats,omitempty" persistence:"profit_stats"`
+	PersistenceTTL types.Duration  `json:"persistenceTTL"`
 
-	Environment   *bbgo.Environment
-	Session       *bbgo.ExchangeSession
-	OrderExecutor *bbgo.GeneralOrderExecutor
-	Market        types.Market
+	Environment     *bbgo.Environment
+	ExchangeSession *bbgo.ExchangeSession
+	OrderExecutor   *bbgo.GeneralOrderExecutor
+	Market          types.Market
 
 	Symbol string `json:"symbol"`
 
@@ -58,13 +66,21 @@ type Strategy struct {
 	OrderGroupID uint32 `json:"orderGroupID"`
 
 	// RecoverWhenStart option is used for recovering dca states
-	RecoverWhenStart bool `json:"recoverWhenStart"`
+	RecoverWhenStart          bool `json:"recoverWhenStart"`
+	DisableProfitStatsRecover bool `json:"disableProfitStatsRecover"`
+	DisablePositionRecover    bool `json:"disablePositionRecover"`
+
+	// EnableQuoteInvestmentReallocate set to true, the quote investment will be reallocated when the notional or quantity is under minimum.
+	EnableQuoteInvestmentReallocate bool `json:"enableQuoteInvestmentReallocate"`
 
 	// KeepOrdersWhenShutdown option is used for keeping the grid orders when shutting down bbgo
 	KeepOrdersWhenShutdown bool `json:"keepOrdersWhenShutdown"`
 
 	// UseCancelAllOrdersApiWhenClose uses a different API to cancel all the orders on the market when closing a grid
 	UseCancelAllOrdersApiWhenClose bool `json:"useCancelAllOrdersApiWhenClose"`
+
+	// dev mode
+	DevMode *DevMode `json:"devMode"`
 
 	// log
 	logger    *logrus.Entry
@@ -75,15 +91,16 @@ type Strategy struct {
 
 	// private field
 	mu                   sync.Mutex
-	takeProfitPrice      fixedpoint.Value
-	startTimeOfNextRound time.Time
 	nextStateC           chan State
 	state                State
+	collector            *Collector
+	takeProfitPrice      fixedpoint.Value
+	startTimeOfNextRound time.Time
+	nextRoundPaused      bool
 
 	// callbacks
 	common.StatusCallbacks
-	positionCallbacks []func(*types.Position)
-	profitCallbacks   []func(*ProfitStats)
+	profitCallbacks []func(*ProfitStats)
 }
 
 func (s *Strategy) ID() string {
@@ -114,6 +131,7 @@ func (s *Strategy) Defaults() error {
 
 	s.LogFields["symbol"] = s.Symbol
 	s.LogFields["strategy"] = ID
+
 	return nil
 }
 
@@ -130,9 +148,28 @@ func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 	session.Subscribe(types.KLineChannel, s.Symbol, types.SubscribeOptions{Interval: types.Interval1m})
 }
 
+func (s *Strategy) newPrometheusLabels() prometheus.Labels {
+	labels := prometheus.Labels{
+		"exchange": "default",
+		"symbol":   s.Symbol,
+	}
+
+	if s.ExchangeSession != nil {
+		labels["exchange"] = s.ExchangeSession.Name
+	}
+
+	if s.PrometheusLabels == nil {
+		return labels
+	}
+
+	return mergeLabels(s.PrometheusLabels, labels)
+}
+
 func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
 	instanceID := s.InstanceID()
-	s.Session = session
+	s.ExchangeSession = session
+
+	s.logger.Infof("persistence ttl: %s", s.PersistenceTTL.Duration())
 	if s.ProfitStats == nil {
 		s.ProfitStats = newProfitStats(s.Market, s.QuoteInvestment)
 	}
@@ -140,6 +177,35 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 	if s.Position == nil {
 		s.Position = types.NewPositionFromMarket(s.Market)
 	}
+
+	// if dev mode is on and it's not a new strategy
+	if s.DevMode != nil && s.DevMode.Enabled && !s.DevMode.IsNewAccount {
+		s.ProfitStats = newProfitStats(s.Market, s.QuoteInvestment)
+		s.Position = types.NewPositionFromMarket(s.Market)
+	}
+
+	// set ttl for persistence
+	s.Position.SetTTL(s.PersistenceTTL.Duration())
+	s.ProfitStats.SetTTL(s.PersistenceTTL.Duration())
+
+	if s.OrderGroupID == 0 {
+		s.OrderGroupID = util.FNV32(instanceID) % math.MaxInt32
+	}
+
+	// collector
+	s.collector = NewCollector(s.logger, s.Symbol, s.OrderGroupID, s.ExchangeSession.Exchange)
+	if s.collector == nil {
+		return fmt.Errorf("failed to initialize collector")
+	}
+
+	// prometheus
+	if s.PrometheusLabels != nil {
+		initMetrics(labelKeys(s.PrometheusLabels))
+	}
+	registerMetrics()
+
+	// prometheus labels
+	baseLabels = s.newPrometheusLabels()
 
 	s.Position.Strategy = ID
 	s.Position.StrategyInstanceID = instanceID
@@ -152,16 +218,13 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 	}
 
 	s.OrderExecutor = bbgo.NewGeneralOrderExecutor(session, s.Symbol, ID, instanceID, s.Position)
+	s.OrderExecutor.SetMaxRetries(10)
 	s.OrderExecutor.BindEnvironment(s.Environment)
 	s.OrderExecutor.Bind()
 
-	if s.OrderGroupID == 0 {
-		s.OrderGroupID = util.FNV32(instanceID) % math.MaxInt32
-	}
-
 	// order executor
 	s.OrderExecutor.TradeCollector().OnPositionUpdate(func(position *types.Position) {
-		s.logger.Infof("[DCA] POSITION UPDATE: %s", s.Position.String())
+		s.logger.Infof("POSITION UPDATE: %s", s.Position.String())
 		bbgo.Sync(ctx, s)
 
 		// update take profit price here
@@ -169,7 +232,7 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 	})
 
 	s.OrderExecutor.ActiveMakerOrders().OnFilled(func(o types.Order) {
-		s.logger.Infof("[DCA] FILLED ORDER: %s", o.String())
+		s.logger.Infof("FILLED ORDER: %s", o.String())
 		openPositionSide := types.SideTypeBuy
 		takeProfitSide := types.SideTypeSell
 
@@ -179,13 +242,38 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 		case takeProfitSide:
 			s.emitNextState(WaitToOpenPosition)
 		default:
-			s.logger.Infof("[DCA] unsupported side (%s) of order: %s", o.Side, o)
+			s.logger.Infof("unsupported side (%s) of order: %s", o.Side, o)
+		}
+
+		openOrders, err := retry.QueryOpenOrdersUntilSuccessful(ctx, s.ExchangeSession.Exchange, s.Symbol)
+		if err != nil {
+			s.logger.WithError(err).Warn("failed to query open orders when order filled")
+		} else {
+			// update open orders metrics
+			metricsNumOfOpenOrders.With(baseLabels).Set(float64(len(openOrders)))
+		}
+
+		// update active orders metrics
+		numActiveMakerOrders := s.OrderExecutor.ActiveMakerOrders().NumOfOrders()
+		metricsNumOfActiveOrders.With(baseLabels).Set(float64(numActiveMakerOrders))
+
+		if len(openOrders) != numActiveMakerOrders {
+			s.logger.Warnf("num of open orders (%d) and active orders (%d) is different when order filled, please check it.", len(openOrders), numActiveMakerOrders)
+		}
+
+		if err == nil && o.Side == openPositionSide && numActiveMakerOrders == 0 && len(openOrders) == 0 {
+			s.emitNextState(OpenPositionOrdersCancelling)
 		}
 	})
 
 	session.MarketDataStream.OnKLine(func(kline types.KLine) {
 		// check price here
 		if s.state != OpenPositionOrderFilled {
+			return
+		}
+
+		if s.takeProfitPrice.IsZero() {
+			s.logger.Warn("take profit price should not be 0 when there is at least one open-position order filled, please check it")
 			return
 		}
 
@@ -199,23 +287,40 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 	})
 
 	session.UserDataStream.OnAuth(func() {
-		s.logger.Info("[DCA] user data stream authenticated")
+		s.logger.Info("user data stream authenticated")
 		time.AfterFunc(3*time.Second, func() {
 			if isInitialize := s.initializeNextStateC(); !isInitialize {
-				if s.RecoverWhenStart {
-					// recover
-					if err := s.recover(ctx); err != nil {
-						s.logger.WithError(err).Error("[DCA] something wrong when state recovering")
-						return
-					}
+
+				// no need to recover when two situation
+				// 1. recoverWhenStart is false
+				// 2. dev mode is on and it's not new strategy
+				if !s.RecoverWhenStart || (s.DevMode != nil && s.DevMode.Enabled && !s.DevMode.IsNewAccount) {
+					s.updateState(WaitToOpenPosition)
 				} else {
-					s.state = WaitToOpenPosition
+					// recover
+					maxTry := 3
+					for try := 1; try <= maxTry; try++ {
+						s.logger.Infof("try #%d recover", try)
+
+						err := s.recover(ctx)
+						if err == nil {
+							s.logger.Infof("recover successfully at #%d", try)
+							break
+						}
+
+						s.logger.WithError(err).Warnf("failed to recover at #%d", try)
+
+						if try == 3 {
+							s.logger.Errorf("failed to recover after %d trying, please check it", maxTry)
+							return
+						}
+					}
 				}
 
-				s.logger.Infof("[DCA] state: %d", s.state)
-				s.logger.Infof("[DCA] position %s", s.Position.String())
-				s.logger.Infof("[DCA] profit stats %s", s.ProfitStats.String())
-				s.logger.Infof("[DCA] startTimeOfNextRound %s", s.startTimeOfNextRound)
+				s.logger.Infof("state: %d", s.state)
+				s.logger.Infof("position %s", s.Position.String())
+				s.logger.Infof("profit stats %s", s.ProfitStats.String())
+				s.logger.Infof("startTimeOfNextRound %s", s.startTimeOfNextRound)
 
 				s.updateTakeProfitPrice()
 
@@ -230,6 +335,8 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 			}
 		})
 	})
+
+	go s.runBackgroundTask(ctx)
 
 	bbgo.OnShutdown(ctx, func(ctx context.Context, wg *sync.WaitGroup) {
 		defer wg.Done()
@@ -250,17 +357,17 @@ func (s *Strategy) Run(ctx context.Context, _ bbgo.OrderExecutor, session *bbgo.
 func (s *Strategy) updateTakeProfitPrice() {
 	takeProfitRatio := s.TakeProfitRatio
 	s.takeProfitPrice = s.Market.TruncatePrice(s.Position.AverageCost.Mul(fixedpoint.One.Add(takeProfitRatio)))
-	s.logger.Infof("[DCA] cost: %s, ratio: %s, price: %s", s.Position.AverageCost, takeProfitRatio, s.takeProfitPrice)
+	s.logger.Infof("cost: %s, ratio: %s, price: %s", s.Position.AverageCost.String(), takeProfitRatio.String(), s.takeProfitPrice.String())
 }
 
 func (s *Strategy) Close(ctx context.Context) error {
-	s.logger.Infof("[DCA] closing %s dca2", s.Symbol)
+	s.logger.Infof("closing %s dca2", s.Symbol)
 
 	defer s.EmitClosed()
 
 	err := s.OrderExecutor.GracefulCancel(ctx)
 	if err != nil {
-		s.logger.WithError(err).Errorf("[DCA] there are errors when cancelling orders at close")
+		s.logger.WithError(err).Errorf("there are errors when cancelling orders at close")
 	}
 
 	bbgo.Sync(ctx, s)
@@ -271,35 +378,34 @@ func (s *Strategy) CleanUp(ctx context.Context) error {
 	_ = s.Initialize()
 	defer s.EmitClosed()
 
-	session := s.Session
+	session := s.ExchangeSession
 	if session == nil {
 		return fmt.Errorf("Session is nil, please check it")
 	}
 
-	service, support := session.Exchange.(advancedOrderCancelApi)
-	if !support {
-		return fmt.Errorf("advancedOrderCancelApi interface is not implemented, fallback to default graceful cancel, exchange %T", session)
+	// ignore the first cancel error, this skips one open-orders query request
+	if err := tradingutil.UniversalCancelAllOrders(ctx, session.Exchange, nil); err == nil {
+		return nil
 	}
 
+	// if cancel all orders returns error, get the open orders and retry the cancel in each round
 	var werr error
 	for {
 		s.logger.Infof("checking %s open orders...", s.Symbol)
 
 		openOrders, err := retry.QueryOpenOrdersUntilSuccessful(ctx, session.Exchange, s.Symbol)
 		if err != nil {
-			s.logger.WithError(err).Errorf("CancelOrdersByGroupID api call error")
-			werr = multierr.Append(werr, err)
+			s.logger.WithError(err).Errorf("unable to query open orders")
+			continue
 		}
 
+		// all clean up
 		if len(openOrders) == 0 {
 			break
 		}
 
-		s.logger.Infof("found %d open orders left, using cancel all orders api", len(openOrders))
-
-		s.logger.Infof("using cancal all orders api for canceling grid orders...")
-		if err := retry.CancelAllOrdersUntilSuccessful(ctx, service); err != nil {
-			s.logger.WithError(err).Errorf("CancelAllOrders api call error")
+		if err := tradingutil.UniversalCancelAllOrders(ctx, session.Exchange, openOrders); err != nil {
+			s.logger.WithError(err).Errorf("unable to cancel all orders")
 			werr = multierr.Append(werr, err)
 		}
 
@@ -309,84 +415,76 @@ func (s *Strategy) CleanUp(ctx context.Context) error {
 	return werr
 }
 
-func (s *Strategy) CalculateAndEmitProfit(ctx context.Context) error {
-	historyService, ok := s.Session.Exchange.(types.ExchangeTradeHistoryService)
-	if !ok {
-		return fmt.Errorf("exchange %s doesn't support ExchangeTradeHistoryService", s.Session.Exchange.Name())
+// PauseNextRound will stop openning open-position orders at the next round
+func (s *Strategy) PauseNextRound() {
+	s.nextRoundPaused = true
+}
+
+func (s *Strategy) ContinueNextRound() {
+	s.nextRoundPaused = false
+}
+
+func (s *Strategy) UpdateProfitStatsUntilSuccessful(ctx context.Context) error {
+	var op = func() error {
+		if updated, err := s.UpdateProfitStats(ctx); err != nil {
+			return errors.Wrapf(err, "failed to update profit stats, please check it")
+		} else if !updated {
+			return fmt.Errorf("there is no round to update profit stats, please check it")
+		}
+
+		return nil
 	}
 
-	queryService, ok := s.Session.Exchange.(types.ExchangeOrderQueryService)
-	if !ok {
-		return fmt.Errorf("exchange %s doesn't support ExchangeOrderQueryService", s.Session.Exchange.Name())
-	}
+	// exponential increased interval retry until success
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = 5 * time.Second
+	bo.MaxInterval = 20 * time.Minute
+	bo.MaxElapsedTime = 0
 
-	// TODO: pagination for it
-	// query the orders
-	orders, err := historyService.QueryClosedOrders(ctx, s.Symbol, time.Time{}, time.Time{}, s.ProfitStats.FromOrderID)
+	return backoff.Retry(op, backoff.WithContext(bo, ctx))
+}
+
+// UpdateProfitStats will collect round from closed orders and emit update profit stats
+// return true, nil -> there is at least one finished round and all the finished rounds we collect update profit stats successfully
+// return false, nil -> there is no finished round!
+// return true, error -> At least one round update profit stats successfully but there is error when collecting other rounds
+func (s *Strategy) UpdateProfitStats(ctx context.Context) (bool, error) {
+	rounds, err := s.collector.CollectFinishRounds(ctx, s.ProfitStats.FromOrderID)
 	if err != nil {
-		return err
+		return false, errors.Wrapf(err, "failed to collect finish rounds from #%d", s.ProfitStats.FromOrderID)
 	}
 
-	var rounds []Round
-	var round Round
-	for _, order := range orders {
-		// skip not this strategy order
-		if order.GroupID != s.OrderGroupID {
-			continue
-		}
-
-		switch order.Side {
-		case types.SideTypeBuy:
-			round.OpenPositionOrders = append(round.OpenPositionOrders, order)
-		case types.SideTypeSell:
-			if order.Status != types.OrderStatusFilled {
-				continue
-			}
-			round.TakeProfitOrder = order
-			rounds = append(rounds, round)
-			round = Round{}
-		default:
-			s.logger.Errorf("there is order with unsupported side")
-		}
-	}
-
+	var updated bool = false
 	for _, round := range rounds {
-		var roundOrders []types.Order = round.OpenPositionOrders
-		roundOrders = append(roundOrders, round.TakeProfitOrder)
-		for _, order := range roundOrders {
-			s.logger.Infof("[DCA] calculate profit stats from order: %s", order.String())
-
-			// skip no trade orders
-			if order.ExecutedQuantity.Sign() == 0 {
-				continue
-			}
-
-			trades, err := queryService.QueryOrderTrades(ctx, types.OrderQuery{
-				Symbol:  order.Symbol,
-				OrderID: strconv.FormatUint(order.OrderID, 10),
-			})
-
-			if err != nil {
-				return err
-			}
-
-			for _, trade := range trades {
-				s.logger.Infof("[DCA] calculate profit stats from trade: %s", trade.String())
-				s.ProfitStats.AddTrade(trade)
-			}
+		trades, err := s.collector.CollectRoundTrades(ctx, round)
+		if err != nil {
+			return updated, errors.Wrapf(err, "failed to collect the trades of round")
 		}
 
+		for _, trade := range trades {
+			s.logger.Infof("update profit stats from trade: %s", trade.String())
+			s.ProfitStats.AddTrade(trade)
+		}
+
+		// update profit stats FromOrderID to make sure we will not collect duplicated rounds
 		s.ProfitStats.FromOrderID = round.TakeProfitOrder.OrderID + 1
+
+		// update quote investment
 		s.ProfitStats.QuoteInvestment = s.ProfitStats.QuoteInvestment.Add(s.ProfitStats.CurrentRoundProfit)
 
-		// store into persistence
+		// sync to persistence
 		bbgo.Sync(ctx, s)
+		updated = true
+
+		s.logger.Infof("profit stats:\n%s", s.ProfitStats.String())
 
 		// emit profit
 		s.EmitProfit(s.ProfitStats)
+		updateProfitMetrics(s.ProfitStats.Round, s.ProfitStats.CurrentRoundProfit.Float64())
 
+		// make profit stats forward to new round
 		s.ProfitStats.NewRound()
 	}
 
-	return nil
+	return updated, nil
 }

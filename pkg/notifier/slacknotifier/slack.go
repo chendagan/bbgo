@@ -14,7 +14,7 @@ import (
 	"github.com/slack-go/slack"
 )
 
-var limiter = rate.NewLimiter(rate.Every(1*time.Second), 1)
+var limiter = rate.NewLimiter(rate.Every(1*time.Second), 3)
 
 type notifyTask struct {
 	Channel string
@@ -82,6 +82,13 @@ func filterSlackAttachments(args []interface{}) (slackAttachments []slack.Attach
 			}
 
 			slackAttachments = append(slackAttachments, a)
+
+		case *slack.Attachment:
+			if firstAttachmentOffset == -1 {
+				firstAttachmentOffset = idx
+			}
+
+			slackAttachments = append(slackAttachments, *a)
 
 		case types.SlackAttachmentCreator:
 			if firstAttachmentOffset == -1 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/c9s/bbgo/pkg/bbgo"
 	"github.com/c9s/bbgo/pkg/exchange/retry"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
@@ -14,13 +15,13 @@ type cancelOrdersByGroupIDApi interface {
 }
 
 func (s *Strategy) placeOpenPositionOrders(ctx context.Context) error {
-	s.logger.Infof("[DCA] start placing open position orders")
-	price, err := getBestPriceUntilSuccess(ctx, s.Session.Exchange, s.Symbol)
+	s.logger.Infof("start placing open position orders")
+	price, err := getBestPriceUntilSuccess(ctx, s.ExchangeSession.Exchange, s.Symbol)
 	if err != nil {
 		return err
 	}
 
-	orders, err := generateOpenPositionOrders(s.Market, s.ProfitStats.QuoteInvestment, price, s.PriceDeviation, s.MaxOrderCount, s.OrderGroupID)
+	orders, err := generateOpenPositionOrders(s.Market, s.EnableQuoteInvestmentReallocate, s.QuoteInvestment, s.ProfitStats.TotalProfit, price, s.PriceDeviation, s.MaxOrderCount, s.OrderGroupID)
 	if err != nil {
 		return err
 	}
@@ -31,6 +32,21 @@ func (s *Strategy) placeOpenPositionOrders(ctx context.Context) error {
 	}
 
 	s.debugOrders(createdOrders)
+
+	if s.DevMode != nil && s.DevMode.Enabled && s.DevMode.IsNewAccount {
+		if len(createdOrders) > 0 {
+			s.ProfitStats.FromOrderID = createdOrders[0].OrderID
+		}
+
+		for _, createdOrder := range createdOrders {
+			if s.ProfitStats.FromOrderID > createdOrder.OrderID {
+				s.ProfitStats.FromOrderID = createdOrder.OrderID
+			}
+		}
+
+		s.DevMode.IsNewAccount = false
+		bbgo.Sync(ctx, s)
+	}
 
 	return nil
 }
@@ -44,8 +60,9 @@ func getBestPriceUntilSuccess(ctx context.Context, ex types.Exchange, symbol str
 	return ticker.Sell, nil
 }
 
-func generateOpenPositionOrders(market types.Market, quoteInvestment, price, priceDeviation fixedpoint.Value, maxOrderCount int64, orderGroupID uint32) ([]types.SubmitOrder, error) {
+func generateOpenPositionOrders(market types.Market, enableQuoteInvestmentReallocate bool, quoteInvestment, profit, price, priceDeviation fixedpoint.Value, maxOrderCount int64, orderGroupID uint32) ([]types.SubmitOrder, error) {
 	factor := fixedpoint.One.Sub(priceDeviation)
+	profit = market.TruncatePrice(profit)
 
 	// calculate all valid prices
 	var prices []fixedpoint.Value
@@ -66,11 +83,21 @@ func generateOpenPositionOrders(market types.Market, quoteInvestment, price, pri
 		return nil, fmt.Errorf("failed to calculate notional and num of open position orders, price: %s, quote investment: %s", price, quoteInvestment)
 	}
 
+	if !enableQuoteInvestmentReallocate && orderNum != int(maxOrderCount) {
+		return nil, fmt.Errorf("failed to generate open-position orders due to the orders may be under min notional or quantity")
+	}
+
 	side := types.SideTypeBuy
 
 	var submitOrders []types.SubmitOrder
 	for i := 0; i < orderNum; i++ {
-		quantity := market.TruncateQuantity(notional.Div(prices[i]))
+		var quantity fixedpoint.Value
+		// all the profit will use in the first order
+		if i == 0 {
+			quantity = market.TruncateQuantity(notional.Add(profit).Div(prices[i]))
+		} else {
+			quantity = market.TruncateQuantity(notional.Div(prices[i]))
+		}
 		submitOrders = append(submitOrders, types.SubmitOrder{
 			Symbol:      market.Symbol,
 			Market:      market,

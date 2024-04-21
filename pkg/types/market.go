@@ -10,6 +10,8 @@ import (
 )
 
 type Market struct {
+	Exchange ExchangeName `json:"exchange,omitempty"`
+
 	Symbol string `json:"symbol"`
 
 	// LocalSymbol is used for exchange's API (exchange package internal)
@@ -215,6 +217,10 @@ func (m Market) CanonicalizeVolume(val fixedpoint.Value) float64 {
 	// TODO Round
 	p := math.Pow10(m.VolumePrecision)
 	return math.Trunc(p*val.Float64()) / p
+}
+
+func (m Market) AdjustQuantityByMinQuantity(quantity fixedpoint.Value)  fixedpoint.Value {
+	return fixedpoint.Max(quantity, m.MinQuantity)
 }
 
 // AdjustQuantityByMinNotional adjusts the quantity to make the amount greater than the given minAmount

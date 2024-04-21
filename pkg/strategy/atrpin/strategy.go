@@ -5,15 +5,16 @@ import (
 	"fmt"
 	"sync"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/c9s/bbgo/pkg/bbgo"
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/strategy/common"
 	"github.com/c9s/bbgo/pkg/types"
+	"github.com/sirupsen/logrus"
 )
 
 const ID = "atrpin"
+
+var log = logrus.WithField("strategy", ID)
 
 func init() {
 	bbgo.RegisterStrategy(ID, &Strategy{})
@@ -117,19 +118,17 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		var orderForms []types.SubmitOrder
 
 		position := s.Strategy.OrderExecutor.Position()
-		if !position.IsDust() {
-			log.Infof("position: %+v", position)
+		log.Infof("position: %+v", position)
 
-			side := types.SideTypeSell
-			takerPrice := fixedpoint.Zero
+		side := types.SideTypeBuy
+		takerPrice := ticker.Sell
+		if position.IsLong() {
+			side = types.SideTypeSell
+			takerPrice = ticker.Buy
+		}
 
-			if position.IsShort() {
-				side = types.SideTypeBuy
-				takerPrice = ticker.Sell
-			} else if position.IsLong() {
-				side = types.SideTypeSell
-				takerPrice = ticker.Buy
-			}
+		if !position.IsDust(takerPrice) {
+			log.Infof("%s position is not dust", s.Symbol)
 
 			orderForms = append(orderForms, types.SubmitOrder{
 				Symbol:      s.Symbol,
@@ -145,7 +144,7 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 			log.Infof("SUBMIT TAKER ORDER: %+v", orderForms)
 
 			if _, err := s.Strategy.OrderExecutor.SubmitOrders(ctx, orderForms...); err != nil {
-				log.WithError(err).Error("unable to submit orders")
+				log.WithError(err).Errorf("unable to submit orders: %+v", orderForms)
 			}
 
 			return
@@ -179,14 +178,14 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		}
 
 		if len(orderForms) == 0 {
-			log.Infof("no order to place")
+			log.Infof("no %s order to place", s.Symbol)
 			return
 		}
 
-		log.Infof("bid/ask: %f/%f", bidPrice.Float64(), askPrice.Float64())
+		log.Infof("%s bid/ask: %f/%f", s.Symbol, bidPrice.Float64(), askPrice.Float64())
 
 		if _, err := s.Strategy.OrderExecutor.SubmitOrders(ctx, orderForms...); err != nil {
-			log.WithError(err).Error("unable to submit orders")
+			log.WithError(err).Errorf("unable to submit orders: %+v", orderForms)
 		}
 	}))
 

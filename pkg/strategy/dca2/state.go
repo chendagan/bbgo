@@ -7,6 +7,10 @@ import (
 	"github.com/c9s/bbgo/pkg/bbgo"
 )
 
+const (
+	openPositionRetryInterval = 10 * time.Minute
+)
+
 type State int64
 
 const (
@@ -46,6 +50,13 @@ func (s *Strategy) initializeNextStateC() bool {
 	return isInitialize
 }
 
+func (s *Strategy) updateState(state State) {
+	s.state = state
+
+	s.logger.Infof("[state] update state to %d", state)
+	metricsState.With(baseLabels).Set(float64(s.state))
+}
+
 func (s *Strategy) emitNextState(nextState State) {
 	select {
 	case s.nextStateC <- nextState:
@@ -63,19 +74,22 @@ func (s *Strategy) emitNextState(nextState State) {
 // TakeProfitReady -> the takeProfit order filled ->
 func (s *Strategy) runState(ctx context.Context) {
 	s.logger.Info("[DCA] runState")
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	stateTriggerTicker := time.NewTicker(5 * time.Second)
+	defer stateTriggerTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			s.logger.Info("[DCA] runState DONE")
 			return
-		case <-ticker.C:
-			s.logger.Infof("[DCA] triggerNextState current state: %d", s.state)
+		case <-stateTriggerTicker.C:
+			// s.logger.Infof("[DCA] triggerNextState current state: %d", s.state)
 			s.triggerNextState()
 		case nextState := <-s.nextStateC:
-			s.logger.Infof("[DCA] currenct state: %d, next state: %d", s.state, nextState)
+			// next state == current state -> skip
+			if nextState == s.state {
+				continue
+			}
 
 			// check the next state is valid
 			validNextState, exist := stateTransition[s.state]
@@ -126,32 +140,43 @@ func (s *Strategy) triggerNextState() {
 }
 
 func (s *Strategy) runWaitToOpenPositionState(ctx context.Context, next State) {
-	s.logger.Info("[State] WaitToOpenPosition - check startTimeOfNextRound")
+	if s.nextRoundPaused {
+		s.logger.Info("[State] WaitToOpenPosition - nextRoundPaused is set")
+		return
+	}
+
 	if time.Now().Before(s.startTimeOfNextRound) {
 		return
 	}
 
-	s.state = PositionOpening
+	s.updateState(PositionOpening)
 	s.logger.Info("[State] WaitToOpenPosition -> PositionOpening")
 }
 
 func (s *Strategy) runPositionOpening(ctx context.Context, next State) {
 	s.logger.Info("[State] PositionOpening - start placing open-position orders")
+
 	if err := s.placeOpenPositionOrders(ctx); err != nil {
-		s.logger.WithError(err).Error("failed to place dca orders, please check it.")
+		s.logger.WithError(err).Error("failed to place open-position orders, please check it.")
+
+		// try after 1 minute when failed to placing orders
+		s.startTimeOfNextRound = s.startTimeOfNextRound.Add(openPositionRetryInterval)
+		s.logger.Infof("reset startTimeOfNextRound to %s", s.startTimeOfNextRound.String())
+		s.updateState(WaitToOpenPosition)
 		return
 	}
-	s.state = OpenPositionReady
+
+	s.updateState(OpenPositionReady)
 	s.logger.Info("[State] PositionOpening -> OpenPositionReady")
 }
 
 func (s *Strategy) runOpenPositionReady(_ context.Context, next State) {
-	s.state = OpenPositionOrderFilled
+	s.updateState(OpenPositionOrderFilled)
 	s.logger.Info("[State] OpenPositionReady -> OpenPositionOrderFilled")
 }
 
 func (s *Strategy) runOpenPositionOrderFilled(_ context.Context, next State) {
-	s.state = OpenPositionOrdersCancelling
+	s.updateState(OpenPositionOrdersCancelling)
 	s.logger.Info("[State] OpenPositionOrderFilled -> OpenPositionOrdersCancelling")
 
 	// after open position cancelling, immediately trigger open position cancelled to cancel the other orders
@@ -164,7 +189,7 @@ func (s *Strategy) runOpenPositionOrdersCancelling(ctx context.Context, next Sta
 		s.logger.WithError(err).Error("failed to cancel maker orders")
 		return
 	}
-	s.state = OpenPositionOrdersCancelled
+	s.updateState(OpenPositionOrdersCancelled)
 	s.logger.Info("[State] OpenPositionOrdersCancelling -> OpenPositionOrdersCancelled")
 
 	// after open position cancelled, immediately trigger take profit ready to open take-profit order
@@ -177,7 +202,7 @@ func (s *Strategy) runOpenPositionOrdersCancelled(ctx context.Context, next Stat
 		s.logger.WithError(err).Error("failed to open take profit orders")
 		return
 	}
-	s.state = TakeProfitReady
+	s.updateState(TakeProfitReady)
 	s.logger.Info("[State] OpenPositionOrdersCancelled -> TakeProfitReady")
 }
 
@@ -187,19 +212,22 @@ func (s *Strategy) runTakeProfitReady(ctx context.Context, next State) {
 
 	s.logger.Info("[State] TakeProfitReady - start reseting position and calculate quote investment for next round")
 
-	// reset position
-
-	// calculate profit stats
-	s.CalculateAndEmitProfit(ctx)
+	// update profit stats
+	if err := s.UpdateProfitStatsUntilSuccessful(ctx); err != nil {
+		s.logger.WithError(err).Warn("failed to calculate and emit profit")
+	}
 
 	// reset position and open new round for profit stats before position opening
 	s.Position.Reset()
+
+	// emit position
+	s.OrderExecutor.TradeCollector().EmitPositionUpdate(s.Position)
 
 	// store into redis
 	bbgo.Sync(ctx, s)
 
 	// set the start time of the next round
 	s.startTimeOfNextRound = time.Now().Add(s.CoolDownInterval.Duration())
-	s.state = WaitToOpenPosition
-	s.logger.Info("[State] TakeProfitReady -> WaitToOpenPosition")
+	s.updateState(WaitToOpenPosition)
+	s.logger.Infof("[State] TakeProfitReady -> WaitToOpenPosition (startTimeOfNextRound: %s)", s.startTimeOfNextRound.String())
 }
